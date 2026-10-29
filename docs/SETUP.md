@@ -1,16 +1,29 @@
 # Home Connect — Setup
 
-Vestaboard **Note** (15×3) status for up to **5** Home Connect appliances.
+OAuth flow: **Device Flow** (as set in the Home Connect developer portal).
 
-## Security
+## Portal credentials (names match Home Connect)
 
-- **Username** stored as plain identity (email).
-- **Password**, **client secret**, and **refresh token** are **encrypted on Save** (Fernet).
-- Prefer setting env `HOME_CONNECT_FERNET_KEY` or `FIESTABOARD_SECRET_KEY` (passphrase or 44-char Fernet key) so encryption is stable across restarts/hosts.
+| Portal label | Plugin setting |
+|--------------|----------------|
+| **API Web Client ID** | API Web Client ID |
+| **Fiestaboard Client ID** | Fiestaboard Client ID |
+| **Fiestaboard Client Secret** | Fiestaboard Client Secret (encrypted on Save) |
 
-Production Home Connect apps usually need **OAuth authorization code → refresh_token**. Password grant works mainly on the **simulator**.
+Home Connect does **not** show long-lived token IDs in the portal. Tokens are obtained only via **Device Flow** and then stored encrypted by the plugin.
 
-## Note (primary = first appliance)
+## Authorize (Device Flow)
+
+1. Enter the three client values from the portal  
+2. Turn **Start Device Flow (OAuth)** **ON**  
+3. **Save Changes**  
+4. Check plugin data / logs for:
+   - `device_verify_uri` — open this URL  
+   - `device_user_code` — enter this code and approve access  
+5. After approval, the plugin stores refresh/access tokens and can list appliances  
+6. You can turn **Start Device Flow** OFF once authorized (refresh token is kept)
+
+## Note
 
 ```
 {{home_connect.note_row1}}
@@ -18,56 +31,14 @@ Production Home Connect apps usually need **OAuth authorization code → refresh
 {{home_connect.note_row3}}
 ```
 
-Per appliance (1–5):
+Up to 5 appliances: `appliance_1_…` … `appliance_5_…`
 
-```
-{{home_connect.appliance_1_note_row1}}
-{{home_connect.appliance_1_note_row2}}
-{{home_connect.appliance_1_note_row3}}
-```
+## Refresh & monitoring
 
-## Abridgment
+- **Run refresh now** + Save  
+- Auto refresh default **300 s (5 min)**  
+- Window **07:30–23:45** (UK local), configurable  
 
-Status text is shortened with rule-based “AI-style” abridgment to **≤15 characters** per Note line (operation state → short labels, minutes → `m`, etc.).
+## Demo
 
-## Settings
-
-| Setting | Purpose |
-|---------|---------|
-| User identity | Home Connect email |
-| Password | Encrypted on save |
-| Client ID / secret | Developer portal app |
-| Refresh token | Recommended for live API |
-| Simulator | Use simulator host |
-| Demo mode | 5 sample devices, no login |
-| Appliance filter | Optional name substrings |
-
-## Install
-
-```bash
-curl -X POST http://localhost:4420/api/plugins/install \
-  -H "Content-Type: application/json" \
-  -d '{"repository": "https://github.com/peterdgreenway/fiestaboard-plugin--home-connect"}'
-```
-
-Plugin id: `home_connect` · Author: **peterdgreenway**
-
-
-## Refresh now
-
-1. Turn **Run refresh now** ON  
-2. **Save Changes** — fetches immediately (even outside the monitoring window)
-
-## Auto refresh
-
-Default interval: **300 seconds (5 minutes)** while monitoring is active.  
-Align FiestaBoard page/plugin refresh with `suggested_refresh_seconds`.
-
-## Monitoring window (UK local)
-
-| Setting | Default |
-|---------|---------|
-| Start | **07:30** |
-| Stop | **23:45** |
-
-Outside the window the plugin shows `outside hours` and does not call the API unless **Run refresh now** is used.
+**Demo mode** = sample data, no Home Connect login.

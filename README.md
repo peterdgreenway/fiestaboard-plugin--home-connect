@@ -1,14 +1,9 @@
 # FiestaBoard plugin: Home Connect
 
-Appliance status from **Home Connect** on a Vestaboard **Note**.
+Vestaboard Note status for Home Connect appliances.
 
-- Up to **5** appliances
-- **Encrypted** password / secrets on save
-- Status **abridged** to Note line limits
-- Demo mode for layout testing
+- OAuth **Device Flow**
+- Labels: **API Web Client ID**, **Fiestaboard Client ID**, **Fiestaboard Client Secret**
+- Up to 5 appliances, encrypted secrets, Note abridgment
 
-Author: **peterdgreenway**
-
-## Licence
-
-MIT
+Author: peterdgreenway · MIT

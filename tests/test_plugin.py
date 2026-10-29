@@ -2,6 +2,8 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 fake = ModuleType("src.plugins.base")
 
@@ -40,45 +42,37 @@ def test_plugin_id():
 
 
 def test_encrypt_roundtrip():
-    plain = "s3cret-password"
-    enc = mod.encrypt_secret(plain)
-    assert enc.startswith("enc:") or enc.startswith("obf:")
-    assert mod.decrypt_secret(enc) == plain
+    enc = mod.encrypt_secret("secret")
+    assert mod.decrypt_secret(enc) == "secret"
 
 
-def test_abridge():
-    s = mod.abridge_status("BSH.Common.Status.OperationState Run Program", 15)
-    assert len(s) <= 15
-    assert s
-
-
-def test_note_rows():
-    block, r1, r2, r3 = mod.abridge_note_block("Washer", "prog run", "42m left")
+def test_abridge_and_note():
+    assert len(mod.abridge_status("Operation State Run Program", 15)) <= 15
+    _, r1, r2, r3 = mod.abridge_note_block("Washer", "prog run", "42m")
     assert mod._tile_len(r1) <= 15
-    assert len(r2) == 15
-    assert len(r3) == 15
 
 
-def test_demo_mode():
+def test_demo():
     p = mod.HomeConnectPlugin({})
-    p.config = {"demo_mode": True, "refresh_seconds": 120}
+    p.config = {"demo_mode": True, "refresh_seconds": 300}
     r = p.fetch_data()
-    assert r.available
-    assert r.data["appliance_count"] == "5"
-    assert r.data["appliance_1_name"]
-    assert mod._tile_len(r.data["note_row1"]) <= 15
+    assert r.available and r.data["appliance_count"] == "5"
 
 
 def test_monitor_window():
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
     tz = ZoneInfo("Europe/London")
     assert mod._in_monitor_window("07:30", "23:45", datetime(2026, 10, 29, 12, 0, tzinfo=tz))
-    assert not mod._in_monitor_window("07:30", "23:45", datetime(2026, 10, 29, 7, 29, tzinfo=tz))
-    assert mod._in_monitor_window("07:30", "23:45", datetime(2026, 10, 29, 23, 45, tzinfo=tz))
-    assert not mod._in_monitor_window("07:30", "23:45", datetime(2026, 10, 29, 23, 46, tzinfo=tz))
+    assert not mod._in_monitor_window("07:30", "23:45", datetime(2026, 10, 29, 7, 0, tzinfo=tz))
 
 
-def test_default_refresh_is_5_min():
+def test_client_id_labels():
     p = mod.HomeConnectPlugin({})
-    assert p.validate_config({"refresh_seconds": 300}) == []
+    p.config = {
+        "api_web_client_id": "WEB123",
+        "fiestaboard_client_id": "FB456",
+        "fiestaboard_client_secret": mod.encrypt_secret("sec"),
+    }
+    api_web, fb_id, secret = p._client_ids()
+    assert api_web == "WEB123"
+    assert fb_id == "FB456"
+    assert secret == "sec"

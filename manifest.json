@@ -1,8 +1,8 @@
 {
   "id": "home_connect",
   "name": "Home Connect",
-  "version": "1.1.0",
-  "description": "Home Connect status for Vestaboard Note (up to 5 appliances). Refresh now + every n seconds (default 300). Monitor window 07:30\u201323:45.",
+  "version": "2.0.0",
+  "description": "Home Connect appliances on Vestaboard Note. OAuth Device Flow. Portal labels: API Web Client ID, Fiestaboard Client ID, Fiestaboard Client Secret.",
   "author": "peterdgreenway",
   "icon": "home",
   "category": "data",
@@ -18,32 +18,46 @@
         "PROG RUN       ",
         "42M LEFT       "
       ]
-    },
-    {
-      "device_type": "flagship",
-      "rows": [
-        "HOME CONNECT         ",
-        "{66} Washer  prog run   ",
-        "{65} Dishwasher done    ",
-        "{67} Oven off           ",
-        "                      ",
-        "                      "
-      ]
     }
   ],
   "settings_schema": {
     "type": "object",
     "properties": {
+      "api_web_client_id": {
+        "type": "string",
+        "title": "API Web Client ID",
+        "description": "Exactly as shown in the Home Connect developer portal (API Web Client ID).",
+        "default": ""
+      },
+      "fiestaboard_client_id": {
+        "type": "string",
+        "title": "Fiestaboard Client ID",
+        "description": "Client ID for this Fiestaboard application as shown in the Home Connect portal.",
+        "default": ""
+      },
+      "fiestaboard_client_secret": {
+        "type": "string",
+        "title": "Fiestaboard Client Secret",
+        "description": "Client secret from the Home Connect portal. Encrypted on Save.",
+        "default": "",
+        "ui:widget": "password"
+      },
+      "start_device_flow": {
+        "type": "boolean",
+        "title": "Start Device Flow (OAuth)",
+        "description": "Turn ON and Save to begin Home Connect Device Flow. Open the verification URL, enter the user code, then leave this ON until tokens are stored. OAuth Flow type: Device Flow.",
+        "default": false
+      },
       "run_refresh_now": {
         "type": "boolean",
         "title": "Run refresh now",
-        "description": "Turn ON and Save Changes to fetch appliance status immediately (ignores monitoring window).",
+        "description": "Save to fetch status immediately (ignores monitoring window).",
         "default": false
       },
       "refresh_seconds": {
         "type": "integer",
         "title": "Auto refresh interval (seconds)",
-        "description": "How often to refresh while inside the monitoring window. Default 300 (5 minutes).",
+        "description": "Default 300 (5 minutes) while monitoring is active.",
         "default": 300,
         "minimum": 60,
         "maximum": 3600
@@ -51,58 +65,17 @@
       "monitor_window_enabled": {
         "type": "boolean",
         "title": "Enable monitoring time window",
-        "description": "When on, live polling runs only between start and end times (UK local).",
         "default": true
       },
       "monitor_start": {
         "type": "string",
         "title": "Monitoring start time",
-        "description": "HH:MM local (default 07:30).",
         "default": "07:30"
       },
       "monitor_end": {
         "type": "string",
         "title": "Monitoring stop time",
-        "description": "HH:MM local (default 23:45).",
         "default": "23:45"
-      },
-      "username": {
-        "type": "string",
-        "title": "Home Connect user identity (email)",
-        "description": "Login email / user id for Home Connect.",
-        "default": ""
-      },
-      "password": {
-        "type": "string",
-        "title": "Password (encrypted on save)",
-        "description": "Stored encrypted (Fernet) when the plugin saves settings. Prefer refresh_token for production.",
-        "default": "",
-        "ui:widget": "password"
-      },
-      "client_id": {
-        "type": "string",
-        "title": "API client ID",
-        "description": "From the Home Connect developer portal application.",
-        "default": ""
-      },
-      "client_secret": {
-        "type": "string",
-        "title": "API client secret (encrypted on save)",
-        "default": "",
-        "ui:widget": "password"
-      },
-      "refresh_token": {
-        "type": "string",
-        "title": "OAuth refresh token (encrypted on save)",
-        "description": "Recommended for production. Obtained via Home Connect OAuth authorization code flow.",
-        "default": "",
-        "ui:widget": "password"
-      },
-      "access_token": {
-        "type": "string",
-        "title": "Access token (optional short-lived)",
-        "default": "",
-        "ui:widget": "password"
       },
       "use_simulator": {
         "type": "boolean",
@@ -111,15 +84,19 @@
       },
       "demo_mode": {
         "type": "boolean",
-        "title": "Demo mode (no API login)",
-        "description": "Shows 5 sample appliances without calling Home Connect.",
+        "title": "Demo mode (no API)",
         "default": false
       },
       "appliance_filter": {
         "type": "string",
         "title": "Appliance name filter (optional)",
-        "description": "Comma-separated name/type substrings to include. Max 5 devices after filter.",
         "default": ""
+      },
+      "oauth_scopes": {
+        "type": "string",
+        "title": "OAuth scopes",
+        "description": "Space-separated. Default includes IdentifyAppliance Monitor Control Settings.",
+        "default": "IdentifyAppliance Monitor Control Settings"
       }
     }
   },
@@ -129,12 +106,22 @@
       "name",
       "status",
       "detail",
-      "username",
       "note_row1",
       "note_row2",
       "note_row3",
       "note_block",
       "last_updated",
+      "run_refresh_now",
+      "refresh_seconds",
+      "suggested_refresh_seconds",
+      "refresh_mode",
+      "monitor_window_active",
+      "monitor_start",
+      "monitor_end",
+      "oauth_flow",
+      "device_user_code",
+      "device_verify_uri",
+      "fiestaboard_client_id",
       "appliance_1_name",
       "appliance_1_status",
       "appliance_1_detail",
@@ -169,14 +156,7 @@
       "appliance_5_note_block",
       "appliance_5_note_row1",
       "appliance_5_note_row2",
-      "appliance_5_note_row3",
-      "run_refresh_now",
-      "refresh_seconds",
-      "suggested_refresh_seconds",
-      "refresh_mode",
-      "monitor_window_active",
-      "monitor_start",
-      "monitor_end"
+      "appliance_5_note_row3"
     ],
     "arrays": {
       "appliances": {
@@ -204,12 +184,15 @@
     "name": 20,
     "status": 15,
     "detail": 15,
-    "username": 40,
     "note_row1": 22,
     "note_row2": 15,
     "note_row3": 15,
     "note_block": 70,
     "last_updated": 20,
+    "device_user_code": 32,
+    "device_verify_uri": 120,
+    "oauth_flow": 12,
+    "fiestaboard_client_id": 40,
     "appliance_1_name": 20,
     "appliance_1_status": 15,
     "appliance_1_detail": 15,
