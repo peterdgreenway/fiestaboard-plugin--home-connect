@@ -1,8 +1,8 @@
 {
   "id": "home_connect",
   "name": "Home Connect",
-  "version": "2.0.0",
-  "description": "Home Connect appliances on Vestaboard Note. OAuth Device Flow. Portal labels: API Web Client ID, Fiestaboard Client ID, Fiestaboard Client Secret.",
+  "version": "2.2.1",
+  "description": "Home Connect on Vestaboard Note. Authorization Code OAuth. Labels: API Web Client ID, Fiestaboard Client ID/Secret. Refresh now, 5\u2011min poll, 07:30\u201323:45 window, up to 5 appliances.",
   "author": "peterdgreenway",
   "icon": "home",
   "category": "data",
@@ -26,38 +26,57 @@
       "api_web_client_id": {
         "type": "string",
         "title": "API Web Client ID",
-        "description": "Exactly as shown in the Home Connect developer portal (API Web Client ID).",
+        "description": "As shown in the Home Connect developer portal.",
         "default": ""
       },
       "fiestaboard_client_id": {
         "type": "string",
         "title": "Fiestaboard Client ID",
-        "description": "Client ID for this Fiestaboard application as shown in the Home Connect portal.",
+        "description": "Client ID for this application from the Home Connect portal.",
         "default": ""
       },
       "fiestaboard_client_secret": {
         "type": "string",
         "title": "Fiestaboard Client Secret",
-        "description": "Client secret from the Home Connect portal. Encrypted on Save.",
+        "description": "Client secret from the portal. Encrypted on Save.",
         "default": "",
         "ui:widget": "password"
       },
-      "start_device_flow": {
+      "redirect_uri": {
+        "type": "string",
+        "title": "Redirect URI",
+        "description": "Must match the Redirect URI registered on the Home Connect application exactly (e.g. http://localhost).",
+        "default": "http://localhost"
+      },
+      "authorization_code": {
+        "type": "string",
+        "title": "Authorization code",
+        "description": "After login, paste the code= value from the browser address bar, or the full redirect URL.",
+        "default": "",
+        "ui:widget": "password"
+      },
+      "exchange_authorization_code": {
         "type": "boolean",
-        "title": "Start Device Flow (OAuth)",
-        "description": "Turn ON and Save to begin Home Connect Device Flow. Open the verification URL, enter the user code, then leave this ON until tokens are stored. OAuth Flow type: Device Flow.",
+        "title": "Exchange authorization code",
+        "description": "Turn ON and Save to trade the authorization code for tokens (Authorization Code Grant Flow).",
+        "default": false
+      },
+      "clear_stored_tokens": {
+        "type": "boolean",
+        "title": "Clear stored tokens",
+        "description": "Turn ON and Save to wipe stored access/refresh tokens and force re-authorization.",
         "default": false
       },
       "run_refresh_now": {
         "type": "boolean",
         "title": "Run refresh now",
-        "description": "Save to fetch status immediately (ignores monitoring window).",
+        "description": "Fetch appliance status immediately (ignores monitoring window).",
         "default": false
       },
       "refresh_seconds": {
         "type": "integer",
         "title": "Auto refresh interval (seconds)",
-        "description": "Default 300 (5 minutes) while monitoring is active.",
+        "description": "Default 300 (5 minutes).",
         "default": 300,
         "minimum": 60,
         "maximum": 3600
@@ -95,7 +114,6 @@
       "oauth_scopes": {
         "type": "string",
         "title": "OAuth scopes",
-        "description": "Space-separated. Default includes IdentifyAppliance Monitor Control Settings.",
         "default": "IdentifyAppliance Monitor Control Settings"
       }
     }
@@ -103,6 +121,7 @@
   "variables": {
     "simple": [
       "appliance_count",
+      "online_count",
       "name",
       "status",
       "detail",
@@ -119,12 +138,15 @@
       "monitor_start",
       "monitor_end",
       "oauth_flow",
-      "device_user_code",
-      "device_verify_uri",
+      "auth_status",
+      "authorize_url",
+      "redirect_uri",
+      "has_refresh_token",
       "fiestaboard_client_id",
       "appliance_1_name",
       "appliance_1_status",
       "appliance_1_detail",
+      "appliance_1_connected",
       "appliance_1_note_block",
       "appliance_1_note_row1",
       "appliance_1_note_row2",
@@ -132,6 +154,7 @@
       "appliance_2_name",
       "appliance_2_status",
       "appliance_2_detail",
+      "appliance_2_connected",
       "appliance_2_note_block",
       "appliance_2_note_row1",
       "appliance_2_note_row2",
@@ -139,6 +162,7 @@
       "appliance_3_name",
       "appliance_3_status",
       "appliance_3_detail",
+      "appliance_3_connected",
       "appliance_3_note_block",
       "appliance_3_note_row1",
       "appliance_3_note_row2",
@@ -146,6 +170,7 @@
       "appliance_4_name",
       "appliance_4_status",
       "appliance_4_detail",
+      "appliance_4_connected",
       "appliance_4_note_block",
       "appliance_4_note_row1",
       "appliance_4_note_row2",
@@ -153,10 +178,35 @@
       "appliance_5_name",
       "appliance_5_status",
       "appliance_5_detail",
+      "appliance_5_connected",
       "appliance_5_note_block",
       "appliance_5_note_row1",
       "appliance_5_note_row2",
-      "appliance_5_note_row3"
+      "appliance_5_note_row3",
+      "status_indicator",
+      "status_indicator_name",
+      "status_indicator_label",
+      "status_indicator_pair",
+      "appliance_1_status_indicator",
+      "appliance_1_status_indicator_name",
+      "appliance_1_status_indicator_label",
+      "appliance_1_status_indicator_pair",
+      "appliance_2_status_indicator",
+      "appliance_2_status_indicator_name",
+      "appliance_2_status_indicator_label",
+      "appliance_2_status_indicator_pair",
+      "appliance_3_status_indicator",
+      "appliance_3_status_indicator_name",
+      "appliance_3_status_indicator_label",
+      "appliance_3_status_indicator_pair",
+      "appliance_4_status_indicator",
+      "appliance_4_status_indicator_name",
+      "appliance_4_status_indicator_label",
+      "appliance_4_status_indicator_pair",
+      "appliance_5_status_indicator",
+      "appliance_5_status_indicator_name",
+      "appliance_5_status_indicator_label",
+      "appliance_5_status_indicator_pair"
     ],
     "arrays": {
       "appliances": {
@@ -174,13 +224,18 @@
           "note_row1",
           "note_row2",
           "note_row3",
-          "note_block"
+          "note_block",
+          "status_indicator",
+          "status_indicator_name",
+          "status_indicator_label",
+          "status_indicator_pair"
         ]
       }
     }
   },
   "max_lengths": {
     "appliance_count": 1,
+    "online_count": 1,
     "name": 20,
     "status": 15,
     "detail": 15,
@@ -188,14 +243,14 @@
     "note_row2": 15,
     "note_row3": 15,
     "note_block": 70,
-    "last_updated": 20,
-    "device_user_code": 32,
-    "device_verify_uri": 120,
-    "oauth_flow": 12,
-    "fiestaboard_client_id": 40,
+    "authorize_url": 500,
+    "redirect_uri": 120,
+    "auth_status": 24,
+    "oauth_flow": 20,
     "appliance_1_name": 20,
     "appliance_1_status": 15,
     "appliance_1_detail": 15,
+    "appliance_1_connected": 3,
     "appliance_1_note_block": 70,
     "appliance_1_note_row1": 22,
     "appliance_1_note_row2": 15,
@@ -203,6 +258,7 @@
     "appliance_2_name": 20,
     "appliance_2_status": 15,
     "appliance_2_detail": 15,
+    "appliance_2_connected": 3,
     "appliance_2_note_block": 70,
     "appliance_2_note_row1": 22,
     "appliance_2_note_row2": 15,
@@ -210,6 +266,7 @@
     "appliance_3_name": 20,
     "appliance_3_status": 15,
     "appliance_3_detail": 15,
+    "appliance_3_connected": 3,
     "appliance_3_note_block": 70,
     "appliance_3_note_row1": 22,
     "appliance_3_note_row2": 15,
@@ -217,6 +274,7 @@
     "appliance_4_name": 20,
     "appliance_4_status": 15,
     "appliance_4_detail": 15,
+    "appliance_4_connected": 3,
     "appliance_4_note_block": 70,
     "appliance_4_note_row1": 22,
     "appliance_4_note_row2": 15,
@@ -224,9 +282,34 @@
     "appliance_5_name": 20,
     "appliance_5_status": 15,
     "appliance_5_detail": 15,
+    "appliance_5_connected": 3,
     "appliance_5_note_block": 70,
     "appliance_5_note_row1": 22,
     "appliance_5_note_row2": 15,
-    "appliance_5_note_row3": 15
+    "appliance_5_note_row3": 15,
+    "appliance_1_status_indicator": 12,
+    "appliance_1_status_indicator_name": 12,
+    "appliance_1_status_indicator_label": 12,
+    "appliance_1_status_indicator_pair": 12,
+    "appliance_2_status_indicator": 12,
+    "appliance_2_status_indicator_name": 12,
+    "appliance_2_status_indicator_label": 12,
+    "appliance_2_status_indicator_pair": 12,
+    "appliance_3_status_indicator": 12,
+    "appliance_3_status_indicator_name": 12,
+    "appliance_3_status_indicator_label": 12,
+    "appliance_3_status_indicator_pair": 12,
+    "appliance_4_status_indicator": 12,
+    "appliance_4_status_indicator_name": 12,
+    "appliance_4_status_indicator_label": 12,
+    "appliance_4_status_indicator_pair": 12,
+    "appliance_5_status_indicator": 12,
+    "appliance_5_status_indicator_name": 12,
+    "appliance_5_status_indicator_label": 12,
+    "appliance_5_status_indicator_pair": 12,
+    "status_indicator": 4,
+    "status_indicator_name": 8,
+    "status_indicator_label": 8,
+    "status_indicator_pair": 8
   }
 }

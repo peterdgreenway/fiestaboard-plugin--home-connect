@@ -1,27 +1,30 @@
-# Home Connect — Setup
+# Home Connect — Authorization Code Grant Flow
 
-OAuth flow: **Device Flow** (as set in the Home Connect developer portal).
+## Portal credentials
 
-## Portal credentials (names match Home Connect)
-
-| Portal label | Plugin setting |
-|--------------|----------------|
+| Portal | Plugin |
+|--------|--------|
 | **API Web Client ID** | API Web Client ID |
 | **Fiestaboard Client ID** | Fiestaboard Client ID |
-| **Fiestaboard Client Secret** | Fiestaboard Client Secret (encrypted on Save) |
+| **Fiestaboard Client Secret** | Fiestaboard Client Secret |
 
-Home Connect does **not** show long-lived token IDs in the portal. Tokens are obtained only via **Device Flow** and then stored encrypted by the plugin.
+Register the app with **OAuth Flow = Authorization Code Grant Flow**.  
+**Redirect URI** in the portal must match the plugin (default `http://localhost`).
 
-## Authorize (Device Flow)
+## Authorize once
 
-1. Enter the three client values from the portal  
-2. Turn **Start Device Flow (OAuth)** **ON**  
-3. **Save Changes**  
-4. Check plugin data / logs for:
-   - `device_verify_uri` — open this URL  
-   - `device_user_code` — enter this code and approve access  
-5. After approval, the plugin stores refresh/access tokens and can list appliances  
-6. You can turn **Start Device Flow** OFF once authorized (refresh token is kept)
+1. Enter Client ID, Secret, and Redirect URI → **Save**
+2. Open **`authorize_url`** from plugin data (or build from logs). Example shape:
+
+```text
+https://api.home-connect.com/security/oauth/authorize?response_type=code&client_id=...&redirect_uri=http://localhost&scope=IdentifyAppliance%20Monitor%20Control%20Settings
+```
+
+3. Sign in with your **personal** Home Connect account and **Allow**
+4. Browser goes to e.g. `http://localhost/?code=XXXX` (page may fail to load — that is OK)
+5. Copy the **code** (or whole URL) into **Authorization code**
+6. Turn **Exchange authorization code** ON → **Save**
+7. Tokens are stored encrypted; appliances should list on the next fetch
 
 ## Note
 
@@ -31,14 +34,10 @@ Home Connect does **not** show long-lived token IDs in the portal. Tokens are ob
 {{home_connect.note_row3}}
 ```
 
-Up to 5 appliances: `appliance_1_…` … `appliance_5_…`
+## Other features
 
-## Refresh & monitoring
-
-- **Run refresh now** + Save  
-- Auto refresh default **300 s (5 min)**  
-- Window **07:30–23:45** (UK local), configurable  
-
-## Demo
-
-**Demo mode** = sample data, no Home Connect login.
+- **Run refresh now** · auto refresh default **300 s**
+- Monitor window **07:30–23:45** (UK)
+- Up to **5** appliances · name filter · simulator · demo mode
+- **Clear stored tokens** to force re-login
+- `auth_status`: AUTHORIZED | NEEDS_CODE | …

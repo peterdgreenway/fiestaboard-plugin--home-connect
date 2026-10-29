@@ -1,9 +1,5 @@
-# FiestaBoard plugin: Home Connect
+# Home Connect (FiestaBoard)
 
-Vestaboard Note status for Home Connect appliances.
-
-- OAuth **Device Flow**
-- Labels: **API Web Client ID**, **Fiestaboard Client ID**, **Fiestaboard Client Secret**
-- Up to 5 appliances, encrypted secrets, Note abridgment
+Authorization **Code** OAuth · portal labels · Note 15×3 · up to 5 appliances.
 
 Author: peterdgreenway · MIT

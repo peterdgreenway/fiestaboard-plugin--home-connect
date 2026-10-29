@@ -1,13 +1,14 @@
-"""Home Connect — appliance status for Vestaboard Note (up to 5 devices).
+"""Home Connect — Vestaboard Note status for up to 5 appliances.
 
-OAuth: Device Flow (as registered in the Home Connect developer portal).
+OAuth: Authorization Code Grant Flow (Home Connect developer portal default).
 
 Portal credentials (labels match Home Connect):
   - API Web Client ID
   - Fiestaboard Client ID
   - Fiestaboard Client Secret
 
-Secrets are encrypted on save. Status text is abridged to Note limits.
+Also: encrypted secrets, refresh-now, 5‑minute default poll, monitor window
+07:30–23:45, status abridgment, demo mode, auth status helpers.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ import json
 import logging
 import os
 import re
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,16 +31,17 @@ logger = logging.getLogger(__name__)
 
 NOTE_WIDTH = 15
 MAX_APPLIANCES = 5
-UA = "FiestaBoard-HomeConnect/1.1 (+https://fiestaboard.app)"
+UA = "FiestaBoard-HomeConnect/2.1 (+https://fiestaboard.app)"
 
 API_HOST = "https://api.home-connect.com"
+AUTH_URL = "https://api.home-connect.com/security/oauth/authorize"
 TOKEN_URL = "https://api.home-connect.com/security/oauth/token"
-DEVICE_AUTH_URL = "https://api.home-connect.com/security/oauth/device_authorization"
 SIM_API_HOST = "https://simulator.home-connect.com"
+SIM_AUTH_URL = "https://simulator.home-connect.com/security/oauth/authorize"
 SIM_TOKEN_URL = "https://simulator.home-connect.com/security/oauth/token"
-SIM_DEVICE_AUTH_URL = "https://simulator.home-connect.com/security/oauth/device_authorization"
 
 DEFAULT_SCOPES = "IdentifyAppliance Monitor Control Settings"
+DEFAULT_REDIRECT = "http://localhost"
 
 RED = "{63}"
 ORANGE = "{64}"
@@ -71,21 +72,18 @@ _ABBREV = [
 
 
 def _tile_len(s: str) -> int:
-    codes = re.findall(r"\{\d{2}\}", s)
-    stripped = re.sub(r"\{\d{2}\}", "", s)
-    return len(stripped) + len(codes)
+    return len(re.sub(r"\{\d{2}\}", "", s)) + len(re.findall(r"\{\d{2}\}", s))
 
 
 def _pad(s: str, width: int = NOTE_WIDTH) -> str:
     return (s or "")[:width].ljust(width)
 
 
-def _parse_hhmm(value: str, default: str) -> tuple:
+def _parse_hhmm(value: str, default: str) -> Tuple[int, int]:
     raw = (value or default).strip().replace(".", ":")
     parts = raw.split(":")
     try:
-        h = int(parts[0])
-        m = int(parts[1]) if len(parts) > 1 else 0
+        h, m = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
         if not (0 <= h <= 23 and 0 <= m <= 59):
             raise ValueError
         return h, m
@@ -167,6 +165,47 @@ def decrypt_secret(stored: str) -> str:
     return stored
 
 
+
+def status_indicator(status: str, connected: bool = True) -> Dict[str, str]:
+    """Colour + short label for appliance state (Vestaboard tiles).
+
+    Running → green. Not running (including off/done/ready/offline) → red stop flap.
+    """
+    low = (status or "").lower()
+    is_running = connected and any(
+        x in low
+        for x in ("run", "active", "prog", "operating", "wash", "dry", "cook", "heat")
+    ) and not any(x in low for x in ("off", "inactive", "finished", "done", "ready", "idle"))
+
+    if is_running:
+        return {
+            "indicator": GREEN,
+            "indicator_name": "green",
+            "indicator_label": "RUNNING",
+            "indicator_pair": f"{GREEN}{GREEN}",
+        }
+
+    # Stop / not running → red flap
+    if not connected or "offline" in low or "disconnect" in low:
+        label = "OFFLINE"
+    elif any(x in low for x in ("err", "error", "fault", "fail", "alarm")):
+        label = "ERROR"
+    elif any(x in low for x in ("done", "finished", "complete", "end")):
+        label = "DONE"
+    elif any(x in low for x in ("ready", "idle")):
+        label = "READY"
+    elif any(x in low for x in ("off", "inactive", "standby")):
+        label = "OFF"
+    else:
+        label = "STOPPED"
+
+    return {
+        "indicator": RED,
+        "indicator_name": "red",
+        "indicator_label": label,
+        "indicator_pair": f"{RED}{RED}",
+    }
+
 def abridge_status(text: str, max_len: int = NOTE_WIDTH) -> str:
     if not text:
         return ""
@@ -195,22 +234,20 @@ def abridge_note_block(title: str, status: str, detail: str = "") -> Tuple[str, 
         c1, c2 = GREEN, GREEN
     elif any(x in low for x in ("done", "finished", "ready")):
         c1, c2 = YELLOW, GREEN
-    elif any(x in low for x in ("off", "inactive", "idle")):
+    elif any(x in low for x in ("off", "inactive", "idle", "auth")):
         c1, c2 = BLUE, WHITE
     else:
         c1, c2 = VIOLET, BLUE
     body = (" " + t)[:13].ljust(13)
     r1 = f"{c1}{c2}{body}"
-    while _tile_len(r1) > NOTE_WIDTH and len(body) > 0:
+    while _tile_len(r1) > NOTE_WIDTH and body:
         body = body[:-1]
         r1 = f"{c1}{c2}{body.ljust(13)[:13]}"
-    r2 = _pad(st.upper() if st else "—")
-    r3 = _pad(det.upper() if det else "")
-    return f"{r1}\n{r2}\n{r3}", r1, r2, r3
+    return f"{r1}\n{_pad(st.upper() if st else '—')}\n{_pad(det.upper() if det else '')}", r1, _pad(st.upper() if st else "—"), _pad(det.upper() if det else "")
 
 
 class HomeConnectPlugin(PluginBase):
-    """Home Connect appliance status — Device Flow OAuth, portal-matched labels."""
+    """Home Connect via Authorization Code Grant Flow."""
 
     @property
     def plugin_id(self) -> str:
@@ -220,8 +257,13 @@ class HomeConnectPlugin(PluginBase):
         errors: List[str] = []
         refresh = config.get("refresh_seconds", 300)
         if not isinstance(refresh, int) or refresh < 60:
-            errors.append("refresh_seconds must be an integer >= 60 (default 300)")
-        for key in ("run_refresh_now", "monitor_window_enabled", "start_device_flow"):
+            errors.append("refresh_seconds must be an integer >= 60")
+        for key in (
+            "run_refresh_now",
+            "monitor_window_enabled",
+            "exchange_authorization_code",
+            "clear_stored_tokens",
+        ):
             if key in config and not isinstance(config[key], bool):
                 errors.append(f"{key} must be a boolean")
         for key, default in (("monitor_start", "07:30"), ("monitor_end", "23:45")):
@@ -239,14 +281,19 @@ class HomeConnectPlugin(PluginBase):
         try:
             for key in (
                 "fiestaboard_client_secret",
-                "client_secret",  # legacy
-                "password",
+                "client_secret",
                 "stored_refresh_token",
                 "stored_access_token",
             ):
                 val = new_config.get(key)
                 if isinstance(val, str) and val and not val.startswith(("enc:", "obf:")):
                     new_config[key] = encrypt_secret(val)
+            if bool(new_config.get("clear_stored_tokens", False)):
+                new_config["stored_refresh_token"] = ""
+                new_config["stored_access_token"] = ""
+                new_config["authorization_code"] = ""
+                new_config["clear_stored_tokens"] = False
+                logger.info("Home Connect: stored tokens cleared")
             self.config = dict(new_config)
             self.clear_cache()
         except Exception as e:
@@ -254,17 +301,11 @@ class HomeConnectPlugin(PluginBase):
 
     def _api_roots(self) -> Tuple[str, str, str]:
         if bool(self.config.get("use_simulator", False)):
-            return SIM_API_HOST, SIM_TOKEN_URL, SIM_DEVICE_AUTH_URL
-        return API_HOST, TOKEN_URL, DEVICE_AUTH_URL
+            return SIM_API_HOST, SIM_AUTH_URL, SIM_TOKEN_URL
+        return API_HOST, AUTH_URL, TOKEN_URL
 
     def _client_ids(self) -> Tuple[str, str, str]:
-        """Return (api_web_client_id, fiestaboard_client_id, fiestaboard_client_secret)."""
-        # Prefer new labels; fall back to legacy keys
-        api_web = (
-            self.config.get("api_web_client_id")
-            or self.config.get("client_id")
-            or ""
-        ).strip()
+        api_web = (self.config.get("api_web_client_id") or self.config.get("client_id") or "").strip()
         fb_id = (
             self.config.get("fiestaboard_client_id")
             or self.config.get("client_id")
@@ -272,19 +313,33 @@ class HomeConnectPlugin(PluginBase):
             or ""
         ).strip()
         fb_secret = decrypt_secret(
-            str(
-                self.config.get("fiestaboard_client_secret")
-                or self.config.get("client_secret")
-                or ""
-            )
+            str(self.config.get("fiestaboard_client_secret") or self.config.get("client_secret") or "")
         )
         return api_web, fb_id, fb_secret
 
+    def _redirect_uri(self) -> str:
+        return (self.config.get("redirect_uri") or DEFAULT_REDIRECT).strip() or DEFAULT_REDIRECT
+
+    def _scopes(self) -> str:
+        return (self.config.get("oauth_scopes") or DEFAULT_SCOPES).strip() or DEFAULT_SCOPES
+
+    def build_authorize_url(self) -> str:
+        """URL the user opens to log in and approve the app."""
+        _, auth_url, _ = self._api_roots()
+        _, fb_id, _ = self._client_ids()
+        if not fb_id:
+            return ""
+        params = {
+            "response_type": "code",
+            "client_id": fb_id,
+            "redirect_uri": self._redirect_uri(),
+            "scope": self._scopes(),
+        }
+        return auth_url + "?" + urllib.parse.urlencode(params)
+
     def _token_request(self, body: Dict[str, str]) -> Dict[str, Any]:
-        _, token_url, _ = self._api_roots()
-        data = urllib.parse.urlencode({k: v for k, v in body.items() if v is not None}).encode(
-            "utf-8"
-        )
+        _, _, token_url = self._api_roots()
+        data = urllib.parse.urlencode({k: v for k, v in body.items() if v}).encode("utf-8")
         req = urllib.request.Request(
             token_url,
             data=data,
@@ -294,8 +349,12 @@ class HomeConnectPlugin(PluginBase):
                 "User-Agent": UA,
             },
         )
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            err = e.read().decode("utf-8", errors="replace")[:400]
+            raise RuntimeError(f"Token request failed: {e.code} {err}") from e
 
     def _persist_tokens(self, payload: Dict[str, Any]) -> str:
         access = payload.get("access_token") or ""
@@ -305,139 +364,76 @@ class HomeConnectPlugin(PluginBase):
         if refresh:
             self.config["stored_refresh_token"] = encrypt_secret(refresh)
         if not access:
-            raise RuntimeError(payload.get("error_description") or payload.get("error") or "no token")
+            raise RuntimeError(payload.get("error_description") or payload.get("error") or "no access_token")
+        # Clear one-time code after success
+        self.config["authorization_code"] = ""
+        self.config["exchange_authorization_code"] = False
         return access
 
-    def _device_flow_login(self) -> str:
-        """OAuth 2.0 Device Flow as registered for this Home Connect application."""
-        api_web, fb_id, fb_secret = self._client_ids()
-        client_id = fb_id or api_web
-        if not client_id:
+    def _exchange_authorization_code(self) -> str:
+        """Authorization Code Grant — exchange ?code= for tokens."""
+        _, fb_id, fb_secret = self._client_ids()
+        code = (self.config.get("authorization_code") or "").strip()
+        # Allow pasting full redirect URL
+        if "code=" in code:
+            qs = urllib.parse.urlparse(code)
+            if not qs.query and code.startswith("http"):
+                qs = urllib.parse.urlparse(code)
+            parsed = urllib.parse.parse_qs(qs.query if qs.query else code.split("?", 1)[-1])
+            code = (parsed.get("code") or [code])[0]
+        if not fb_id or not code:
             raise RuntimeError(
-                "Set Fiestaboard Client ID (and API Web Client ID if shown) from the portal"
+                "Set Fiestaboard Client ID and paste the authorization code (or full redirect URL)"
             )
-
-        _, _, device_url = self._api_roots()
-        scope = (self.config.get("oauth_scopes") or DEFAULT_SCOPES).strip()
         body = {
-            "client_id": client_id,
-            "scope": scope,
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": fb_id,
+            "redirect_uri": self._redirect_uri(),
         }
         if fb_secret:
             body["client_secret"] = fb_secret
-
-        data = urllib.parse.urlencode(body).encode("utf-8")
-        req = urllib.request.Request(
-            device_url,
-            data=data,
-            method="POST",
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": UA,
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=45) as resp:
-                dev = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace")[:300]
-            raise RuntimeError(f"Device authorization failed: {e.code} {err_body}") from e
-
-        device_code = dev.get("device_code")
-        user_code = dev.get("user_code")
-        verify_uri = (
-            dev.get("verification_uri_complete")
-            or dev.get("verification_uri")
-            or "https://api.home-connect.com/security/oauth/device_verify"
-        )
-        interval = int(dev.get("interval") or 5)
-        expires = int(dev.get("expires_in") or 300)
-
-        if not device_code:
-            raise RuntimeError(f"Device flow: no device_code in response: {dev}")
-
-        # Surface codes for the operator (also returned in PluginResult data on timeout)
-        self.config["_device_user_code"] = user_code or ""
-        self.config["_device_verify_uri"] = verify_uri
-        logger.info(
-            "Home Connect Device Flow: visit %s and enter code %s",
-            verify_uri,
-            user_code,
-        )
-
-        deadline = time.time() + expires
-        while time.time() < deadline:
-            time.sleep(max(interval, 3))
-            try:
-                token_body = {
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                    "device_code": device_code,
-                    "client_id": client_id,
-                }
-                if fb_secret:
-                    token_body["client_secret"] = fb_secret
-                payload = self._token_request(token_body)
-                return self._persist_tokens(payload)
-            except urllib.error.HTTPError as e:
-                err = e.read().decode("utf-8", errors="replace")
-                try:
-                    ej = json.loads(err)
-                    code = ej.get("error") or ""
-                except Exception:
-                    code = err
-                if "authorization_pending" in str(code) or e.code == 400 and "pending" in err:
-                    continue
-                if "slow_down" in str(code):
-                    interval += 5
-                    continue
-                raise RuntimeError(f"Device flow token poll: {e.code} {err[:200]}") from e
-
-        raise RuntimeError(
-            f"Device flow timed out. Open {verify_uri} and enter code {user_code}, "
-            "then enable Start device flow again."
-        )
+        payload = self._token_request(body)
+        return self._persist_tokens(payload)
 
     def _get_token(self) -> str:
-        """Access token via stored refresh, device flow, or legacy access token field."""
-        api_web, fb_id, fb_secret = self._client_ids()
-        client_id = fb_id or api_web
+        _, fb_id, fb_secret = self._client_ids()
 
-        # Explicit one-shot access token (optional)
-        raw_access = decrypt_secret(str(self.config.get("stored_access_token") or ""))
-        if raw_access and bool(self.config.get("prefer_stored_access_token", False)):
-            return raw_access
+        if bool(self.config.get("exchange_authorization_code", False)) or (
+            (self.config.get("authorization_code") or "").strip()
+            and not decrypt_secret(str(self.config.get("stored_refresh_token") or ""))
+        ):
+            if (self.config.get("authorization_code") or "").strip():
+                return self._exchange_authorization_code()
 
         refresh = decrypt_secret(str(self.config.get("stored_refresh_token") or ""))
-        if client_id and refresh:
+        if fb_id and refresh:
+            body = {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+                "client_id": fb_id,
+            }
+            if fb_secret:
+                body["client_secret"] = fb_secret
             try:
-                body = {
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh,
-                    "client_id": client_id,
-                }
-                if fb_secret:
-                    body["client_secret"] = fb_secret
-                payload = self._token_request(body)
-                return self._persist_tokens(payload)
+                return self._persist_tokens(self._token_request(body))
             except Exception as e:
                 logger.warning("refresh_token failed: %s", e)
 
-        if bool(self.config.get("start_device_flow", False)):
-            return self._device_flow_login()
+        access = decrypt_secret(str(self.config.get("stored_access_token") or ""))
+        if access:
+            return access
 
-        if raw_access:
-            return raw_access
-
+        auth_url = self.build_authorize_url()
         raise RuntimeError(
-            "Not authorized. Set API Web Client ID + Fiestaboard Client ID/Secret, "
-            "then turn on 'Start Device Flow', Save, and complete login in the browser."
+            "Not authorized. Open authorize_url, log in, then paste the code and "
+            "enable Exchange authorization code. URL: " + (auth_url or "(set Client ID first)")
         )
 
     def _api_get(self, path: str, token: str) -> Dict[str, Any]:
         host, _, _ = self._api_roots()
-        url = host.rstrip("/") + path
         req = urllib.request.Request(
-            url,
+            host.rstrip("/") + path,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.bsh.sdk.v1+json",
@@ -483,6 +479,29 @@ class HomeConnectPlugin(PluginBase):
             detail = str(it.get("displayvalue") or it.get("value") or "")
         return str(primary), str(detail)
 
+    def _auth_meta(self) -> Dict[str, str]:
+        _, fb_id, fb_secret = self._client_ids()
+        has_refresh = bool(decrypt_secret(str(self.config.get("stored_refresh_token") or "")))
+        has_access = bool(decrypt_secret(str(self.config.get("stored_access_token") or "")))
+        if has_refresh:
+            status = "AUTHORIZED"
+        elif has_access:
+            status = "ACCESS_ONLY"
+        elif fb_id and fb_secret:
+            status = "NEEDS_CODE"
+        elif fb_id:
+            status = "NEEDS_SECRET_OR_CODE"
+        else:
+            status = "NEEDS_CLIENT_ID"
+        return {
+            "oauth_flow": "authorization_code",
+            "auth_status": status,
+            "authorize_url": self.build_authorize_url()[:500],
+            "redirect_uri": self._redirect_uri()[:120],
+            "has_refresh_token": "YES" if has_refresh else "NO",
+            "fiestaboard_client_id": (fb_id or "")[:40],
+        }
+
     def fetch_data(self) -> PluginResult:
         try:
             force = bool(self.config.get("run_refresh_now", False))
@@ -491,38 +510,33 @@ class HomeConnectPlugin(PluginBase):
             window_enabled = bool(self.config.get("monitor_window_enabled", True))
             in_window = (not window_enabled) or _in_monitor_window(start, end)
             refresh_seconds = int(self.config.get("refresh_seconds", 300) or 300)
-
             meta = {
+                **self._auth_meta(),
                 "monitor_window_active": "YES" if in_window else "NO",
                 "monitor_start": start,
                 "monitor_end": end,
                 "run_refresh_now": "YES" if force else "NO",
                 "refresh_seconds": str(refresh_seconds),
                 "suggested_refresh_seconds": str(refresh_seconds),
-                "oauth_flow": "device_flow",
-                "device_user_code": str(self.config.get("_device_user_code") or "")[:32],
-                "device_verify_uri": str(self.config.get("_device_verify_uri") or "")[:120],
             }
 
             if not in_window and not force:
                 block, r1, r2, r3 = abridge_note_block("Home", "outside hours", f"{start}-{end}")
-                data = {
-                    **meta,
-                    "appliance_count": "0",
-                    "name": "Home",
-                    "status": "outside hours",
-                    "detail": f"{start}-{end}",
-                    "refresh_mode": "OUTSIDE",
-                    "note_row1": r1,
-                    "note_row2": r2,
-                    "note_row3": r3,
-                    "note_block": block,
-                    "appliances": [],
-                    "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                }
-                for i in range(MAX_APPLIANCES):
-                    for suf in ("name", "status", "detail", "note_block", "note_row1", "note_row2", "note_row3"):
-                        data[f"appliance_{i+1}_{suf}"] = ""
+                data = self._empty_appliances(
+                    {
+                        **meta,
+                        "appliance_count": "0",
+                        "name": "Home",
+                        "status": "outside hours",
+                        "detail": f"{start}-{end}",
+                        "refresh_mode": "OUTSIDE",
+                        "note_row1": r1,
+                        "note_row2": r2,
+                        "note_row3": r3,
+                        "note_block": block,
+                        "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                    }
+                )
                 return PluginResult(available=True, data=data)
 
             if bool(self.config.get("demo_mode", False)):
@@ -547,10 +561,13 @@ class HomeConnectPlugin(PluginBase):
             appliances = appliances[:MAX_APPLIANCES]
 
             rows: List[Dict[str, str]] = []
+            online = 0
             for idx, app in enumerate(appliances):
                 ha_id = str(app.get("haId") or app.get("id") or "")
                 name = str(app.get("name") or app.get("type") or f"App{idx+1}")
                 connected = bool(app.get("connected", True))
+                if connected:
+                    online += 1
                 status_items = self._appliance_status(token, ha_id) if ha_id else []
                 primary, detail = self._pick_status_summary(status_items)
                 if not connected:
@@ -558,7 +575,15 @@ class HomeConnectPlugin(PluginBase):
                 short_name = abridge_status(name, 13)
                 short_status = abridge_status(primary, 15)
                 short_detail = abridge_status(detail, 15)
+                ind = status_indicator(short_status + " " + primary, connected)
                 block, r1, r2, r3 = abridge_note_block(short_name, short_status, short_detail)
+                # Prefix Note row1 with status indicator colour pair (replace default pair)
+                body = re.sub(r"^(\{\d{2}\}){1,2}", "", r1)
+                r1 = f"{ind['indicator_pair']}{body}"
+                while _tile_len(r1) > NOTE_WIDTH and body:
+                    body = body[:-1]
+                    r1 = f"{ind['indicator_pair']}{body}"
+                block = f"{r1}\n{r2}\n{r3}"
                 rows.append(
                     {
                         "index": str(idx + 1),
@@ -570,6 +595,10 @@ class HomeConnectPlugin(PluginBase):
                         "status": short_status[:15],
                         "status_full": primary[:80],
                         "detail": short_detail[:15],
+                        "status_indicator": ind["indicator"],
+                        "status_indicator_name": ind["indicator_name"],
+                        "status_indicator_label": ind["indicator_label"],
+                        "status_indicator_pair": ind["indicator_pair"],
                         "note_row1": r1,
                         "note_row2": r2,
                         "note_row3": r3,
@@ -578,17 +607,22 @@ class HomeConnectPlugin(PluginBase):
                 )
 
             if rows:
-                primary_row = rows[0]
+                p0 = rows[0]
                 data = {
                     **meta,
                     "appliance_count": str(len(rows)),
-                    "name": primary_row["name"],
-                    "status": primary_row["status"],
-                    "detail": primary_row["detail"],
-                    "note_row1": primary_row["note_row1"],
-                    "note_row2": primary_row["note_row2"],
-                    "note_row3": primary_row["note_row3"],
-                    "note_block": primary_row["note_block"],
+                    "online_count": str(online),
+                    "name": p0["name"],
+                    "status": p0["status"],
+                    "detail": p0["detail"],
+                    "status_indicator": p0.get("status_indicator", ""),
+                    "status_indicator_name": p0.get("status_indicator_name", ""),
+                    "status_indicator_label": p0.get("status_indicator_label", ""),
+                    "status_indicator_pair": p0.get("status_indicator_pair", ""),
+                    "note_row1": p0["note_row1"],
+                    "note_row2": p0["note_row2"],
+                    "note_row3": p0["note_row3"],
+                    "note_block": p0["note_block"],
                     "appliances": rows,
                     "refresh_mode": "FORCED" if force else "ACTIVE",
                     "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -598,6 +632,7 @@ class HomeConnectPlugin(PluginBase):
                 data = {
                     **meta,
                     "appliance_count": "0",
+                    "online_count": "0",
                     "name": "Home",
                     "status": "no devices",
                     "detail": "check account",
@@ -610,41 +645,50 @@ class HomeConnectPlugin(PluginBase):
                     "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                 }
 
-            for i in range(MAX_APPLIANCES):
-                if i < len(rows):
-                    a = rows[i]
-                    data[f"appliance_{i+1}_name"] = a["name"]
-                    data[f"appliance_{i+1}_status"] = a["status"]
-                    data[f"appliance_{i+1}_detail"] = a["detail"]
-                    data[f"appliance_{i+1}_note_block"] = a["note_block"]
-                    data[f"appliance_{i+1}_note_row1"] = a["note_row1"]
-                    data[f"appliance_{i+1}_note_row2"] = a["note_row2"]
-                    data[f"appliance_{i+1}_note_row3"] = a["note_row3"]
-                else:
-                    for suf in ("name", "status", "detail", "note_block", "note_row1", "note_row2", "note_row3"):
-                        data[f"appliance_{i+1}_{suf}"] = ""
-
-            _, fb_id, _ = self._client_ids()
-            data["fiestaboard_client_id"] = (fb_id or "")[:40]
+            data = self._empty_appliances(data, rows)
             return PluginResult(available=True, data=data)
 
         except Exception as e:
             logger.exception("home_connect error")
-            block, r1, r2, r3 = abridge_note_block("Home", "error", abridge_status(str(e), 15))
-            return PluginResult(
-                available=False,
-                error=str(e)[:160],
-                data={
-                    "note_row1": r1,
-                    "note_row2": r2,
-                    "note_row3": r3,
-                    "note_block": block,
-                    "status": "error",
-                    "oauth_flow": "device_flow",
-                    "device_user_code": str(self.config.get("_device_user_code") or "")[:32],
-                    "device_verify_uri": str(self.config.get("_device_verify_uri") or "")[:120],
-                },
-            )
+            msg = str(e)
+            block, r1, r2, r3 = abridge_note_block("Home", "auth needed" if "Not authorized" in msg else "error", abridge_status(msg, 15))
+            data = {
+                **self._auth_meta(),
+                "note_row1": r1,
+                "note_row2": r2,
+                "note_row3": r3,
+                "note_block": block,
+                "status": "error",
+                "detail": abridge_status(msg, 40),
+            }
+            return PluginResult(available=False, error=msg[:200], data=data)
+
+    def _empty_appliances(self, data: Dict[str, Any], rows: Optional[List[Dict]] = None) -> Dict[str, Any]:
+        rows = rows or []
+        for i in range(MAX_APPLIANCES):
+            if i < len(rows):
+                a = rows[i]
+                data[f"appliance_{i+1}_name"] = a["name"]
+                data[f"appliance_{i+1}_status"] = a["status"]
+                data[f"appliance_{i+1}_detail"] = a["detail"]
+                data[f"appliance_{i+1}_note_block"] = a["note_block"]
+                data[f"appliance_{i+1}_note_row1"] = a["note_row1"]
+                data[f"appliance_{i+1}_note_row2"] = a["note_row2"]
+                data[f"appliance_{i+1}_note_row3"] = a["note_row3"]
+                data[f"appliance_{i+1}_connected"] = a.get("connected", "")
+                data[f"appliance_{i+1}_status_indicator"] = a.get("status_indicator", "")
+                data[f"appliance_{i+1}_status_indicator_name"] = a.get("status_indicator_name", "")
+                data[f"appliance_{i+1}_status_indicator_label"] = a.get("status_indicator_label", "")
+                data[f"appliance_{i+1}_status_indicator_pair"] = a.get("status_indicator_pair", "")
+            else:
+                for suf in (
+                    "name", "status", "detail", "note_block",
+                    "note_row1", "note_row2", "note_row3", "connected",
+                    "status_indicator", "status_indicator_name",
+                    "status_indicator_label", "status_indicator_pair",
+                ):
+                    data[f"appliance_{i+1}_{suf}"] = ""
+        return data
 
     def _demo_data(self) -> Dict[str, Any]:
         samples = [
@@ -656,7 +700,14 @@ class HomeConnectPlugin(PluginBase):
         ]
         rows = []
         for i, (name, st, det) in enumerate(samples):
+            ind = status_indicator(st, True)
             block, r1, r2, r3 = abridge_note_block(name, st, det)
+            body = re.sub(r"^(\{\d{2}\}){1,2}", "", r1)
+            r1 = f"{ind['indicator_pair']}{body}"
+            while _tile_len(r1) > NOTE_WIDTH and body:
+                body = body[:-1]
+                r1 = f"{ind['indicator_pair']}{body}"
+            block = f"{r1}\n{r2}\n{r3}"
             rows.append(
                 {
                     "index": str(i + 1),
@@ -668,6 +719,10 @@ class HomeConnectPlugin(PluginBase):
                     "status": st,
                     "status_full": st,
                     "detail": det,
+                    "status_indicator": ind["indicator"],
+                    "status_indicator_name": ind["indicator_name"],
+                    "status_indicator_label": ind["indicator_label"],
+                    "status_indicator_pair": ind["indicator_pair"],
                     "note_row1": r1,
                     "note_row2": r2,
                     "note_row3": r3,
@@ -676,9 +731,14 @@ class HomeConnectPlugin(PluginBase):
             )
         data: Dict[str, Any] = {
             "appliance_count": "5",
+            "online_count": "5",
             "name": rows[0]["name"],
             "status": rows[0]["status"],
             "detail": rows[0]["detail"],
+            "status_indicator": rows[0].get("status_indicator", ""),
+            "status_indicator_name": rows[0].get("status_indicator_name", ""),
+            "status_indicator_label": rows[0].get("status_indicator_label", ""),
+            "status_indicator_pair": rows[0].get("status_indicator_pair", ""),
             "note_row1": rows[0]["note_row1"],
             "note_row2": rows[0]["note_row2"],
             "note_row3": rows[0]["note_row3"],
@@ -686,13 +746,4 @@ class HomeConnectPlugin(PluginBase):
             "appliances": rows,
             "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         }
-        for i in range(MAX_APPLIANCES):
-            a = rows[i]
-            data[f"appliance_{i+1}_name"] = a["name"]
-            data[f"appliance_{i+1}_status"] = a["status"]
-            data[f"appliance_{i+1}_detail"] = a["detail"]
-            data[f"appliance_{i+1}_note_block"] = a["note_block"]
-            data[f"appliance_{i+1}_note_row1"] = a["note_row1"]
-            data[f"appliance_{i+1}_note_row2"] = a["note_row2"]
-            data[f"appliance_{i+1}_note_row3"] = a["note_row3"]
-        return data
+        return self._empty_appliances(data, rows)

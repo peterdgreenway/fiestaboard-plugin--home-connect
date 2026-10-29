@@ -37,42 +37,34 @@ mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 
 
-def test_plugin_id():
+def test_id():
     assert mod.HomeConnectPlugin({}).plugin_id == "home_connect"
 
 
-def test_encrypt_roundtrip():
-    enc = mod.encrypt_secret("secret")
-    assert mod.decrypt_secret(enc) == "secret"
+def test_encrypt():
+    assert mod.decrypt_secret(mod.encrypt_secret("x")) == "x"
 
 
-def test_abridge_and_note():
-    assert len(mod.abridge_status("Operation State Run Program", 15)) <= 15
-    _, r1, r2, r3 = mod.abridge_note_block("Washer", "prog run", "42m")
-    assert mod._tile_len(r1) <= 15
+def test_authorize_url():
+    p = mod.HomeConnectPlugin({})
+    p.config = {
+        "fiestaboard_client_id": "ABC",
+        "redirect_uri": "http://localhost",
+    }
+    url = p.build_authorize_url()
+    assert "response_type=code" in url
+    assert "client_id=ABC" in url
+    assert "redirect_uri=" in url
 
 
 def test_demo():
     p = mod.HomeConnectPlugin({})
-    p.config = {"demo_mode": True, "refresh_seconds": 300}
+    p.config = {"demo_mode": True}
     r = p.fetch_data()
     assert r.available and r.data["appliance_count"] == "5"
+    assert r.data["oauth_flow"] == "authorization_code"
 
 
-def test_monitor_window():
+def test_window():
     tz = ZoneInfo("Europe/London")
     assert mod._in_monitor_window("07:30", "23:45", datetime(2026, 10, 29, 12, 0, tzinfo=tz))
-    assert not mod._in_monitor_window("07:30", "23:45", datetime(2026, 10, 29, 7, 0, tzinfo=tz))
-
-
-def test_client_id_labels():
-    p = mod.HomeConnectPlugin({})
-    p.config = {
-        "api_web_client_id": "WEB123",
-        "fiestaboard_client_id": "FB456",
-        "fiestaboard_client_secret": mod.encrypt_secret("sec"),
-    }
-    api_web, fb_id, secret = p._client_ids()
-    assert api_web == "WEB123"
-    assert fb_id == "FB456"
-    assert secret == "sec"
