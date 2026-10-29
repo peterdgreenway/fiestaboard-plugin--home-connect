@@ -1,0 +1,217 @@
+{
+  "id": "home_connect",
+  "name": "Home Connect",
+  "version": "1.0.0",
+  "description": "Bosch/Siemens Home Connect appliance status for Vestaboard Note. Up to 5 appliances; encrypted login; AI-style abridged status lines.",
+  "author": "peterdgreenway",
+  "icon": "home",
+  "category": "data",
+  "repository": "https://github.com/peterdgreenway/fiestaboard-plugin--home-connect",
+  "documentation": "docs/SETUP.md",
+  "min_refresh_seconds": 60,
+  "teaser": "{66}{66} WASHER     ",
+  "previews": [
+    {
+      "device_type": "note",
+      "rows": [
+        "{66}{66} WASHER     ",
+        "PROG RUN       ",
+        "42M LEFT       "
+      ]
+    },
+    {
+      "device_type": "flagship",
+      "rows": [
+        "HOME CONNECT         ",
+        "{66} Washer  prog run   ",
+        "{65} Dishwasher done    ",
+        "{67} Oven off           ",
+        "                      ",
+        "                      "
+      ]
+    }
+  ],
+  "settings_schema": {
+    "type": "object",
+    "properties": {
+      "username": {
+        "type": "string",
+        "title": "Home Connect user identity (email)",
+        "description": "Login email / user id for Home Connect.",
+        "default": ""
+      },
+      "password": {
+        "type": "string",
+        "title": "Password (encrypted on save)",
+        "description": "Stored encrypted (Fernet) when the plugin saves settings. Prefer refresh_token for production.",
+        "default": "",
+        "ui:widget": "password"
+      },
+      "client_id": {
+        "type": "string",
+        "title": "API client ID",
+        "description": "From the Home Connect developer portal application.",
+        "default": ""
+      },
+      "client_secret": {
+        "type": "string",
+        "title": "API client secret (encrypted on save)",
+        "default": "",
+        "ui:widget": "password"
+      },
+      "refresh_token": {
+        "type": "string",
+        "title": "OAuth refresh token (encrypted on save)",
+        "description": "Recommended for production. Obtained via Home Connect OAuth authorization code flow.",
+        "default": "",
+        "ui:widget": "password"
+      },
+      "access_token": {
+        "type": "string",
+        "title": "Access token (optional short-lived)",
+        "default": "",
+        "ui:widget": "password"
+      },
+      "use_simulator": {
+        "type": "boolean",
+        "title": "Use Home Connect simulator API",
+        "default": false
+      },
+      "demo_mode": {
+        "type": "boolean",
+        "title": "Demo mode (no API login)",
+        "description": "Shows 5 sample appliances without calling Home Connect.",
+        "default": false
+      },
+      "appliance_filter": {
+        "type": "string",
+        "title": "Appliance name filter (optional)",
+        "description": "Comma-separated name/type substrings to include. Max 5 devices after filter.",
+        "default": ""
+      },
+      "refresh_seconds": {
+        "type": "integer",
+        "title": "Refresh Interval (seconds)",
+        "default": 120,
+        "minimum": 60,
+        "maximum": 3600
+      }
+    }
+  },
+  "variables": {
+    "simple": [
+      "appliance_count",
+      "name",
+      "status",
+      "detail",
+      "username",
+      "note_row1",
+      "note_row2",
+      "note_row3",
+      "note_block",
+      "last_updated",
+      "appliance_1_name",
+      "appliance_1_status",
+      "appliance_1_detail",
+      "appliance_1_note_block",
+      "appliance_1_note_row1",
+      "appliance_1_note_row2",
+      "appliance_1_note_row3",
+      "appliance_2_name",
+      "appliance_2_status",
+      "appliance_2_detail",
+      "appliance_2_note_block",
+      "appliance_2_note_row1",
+      "appliance_2_note_row2",
+      "appliance_2_note_row3",
+      "appliance_3_name",
+      "appliance_3_status",
+      "appliance_3_detail",
+      "appliance_3_note_block",
+      "appliance_3_note_row1",
+      "appliance_3_note_row2",
+      "appliance_3_note_row3",
+      "appliance_4_name",
+      "appliance_4_status",
+      "appliance_4_detail",
+      "appliance_4_note_block",
+      "appliance_4_note_row1",
+      "appliance_4_note_row2",
+      "appliance_4_note_row3",
+      "appliance_5_name",
+      "appliance_5_status",
+      "appliance_5_detail",
+      "appliance_5_note_block",
+      "appliance_5_note_row1",
+      "appliance_5_note_row2",
+      "appliance_5_note_row3"
+    ],
+    "arrays": {
+      "appliances": {
+        "label_field": "name",
+        "item_fields": [
+          "index",
+          "name",
+          "name_full",
+          "ha_id",
+          "type",
+          "connected",
+          "status",
+          "status_full",
+          "detail",
+          "note_row1",
+          "note_row2",
+          "note_row3",
+          "note_block"
+        ]
+      }
+    }
+  },
+  "max_lengths": {
+    "appliance_count": 1,
+    "name": 20,
+    "status": 15,
+    "detail": 15,
+    "username": 40,
+    "note_row1": 22,
+    "note_row2": 15,
+    "note_row3": 15,
+    "note_block": 70,
+    "last_updated": 20,
+    "appliance_1_name": 20,
+    "appliance_1_status": 15,
+    "appliance_1_detail": 15,
+    "appliance_1_note_block": 70,
+    "appliance_1_note_row1": 22,
+    "appliance_1_note_row2": 15,
+    "appliance_1_note_row3": 15,
+    "appliance_2_name": 20,
+    "appliance_2_status": 15,
+    "appliance_2_detail": 15,
+    "appliance_2_note_block": 70,
+    "appliance_2_note_row1": 22,
+    "appliance_2_note_row2": 15,
+    "appliance_2_note_row3": 15,
+    "appliance_3_name": 20,
+    "appliance_3_status": 15,
+    "appliance_3_detail": 15,
+    "appliance_3_note_block": 70,
+    "appliance_3_note_row1": 22,
+    "appliance_3_note_row2": 15,
+    "appliance_3_note_row3": 15,
+    "appliance_4_name": 20,
+    "appliance_4_status": 15,
+    "appliance_4_detail": 15,
+    "appliance_4_note_block": 70,
+    "appliance_4_note_row1": 22,
+    "appliance_4_note_row2": 15,
+    "appliance_4_note_row3": 15,
+    "appliance_5_name": 20,
+    "appliance_5_status": 15,
+    "appliance_5_detail": 15,
+    "appliance_5_note_block": 70,
+    "appliance_5_note_row1": 22,
+    "appliance_5_note_row2": 15,
+    "appliance_5_note_row3": 15
+  }
+}
