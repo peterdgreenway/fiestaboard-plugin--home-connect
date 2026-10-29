@@ -67,3 +67,18 @@ def test_demo_mode():
     assert r.data["appliance_count"] == "5"
     assert r.data["appliance_1_name"]
     assert mod._tile_len(r.data["note_row1"]) <= 15
+
+
+def test_monitor_window():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Europe/London")
+    assert mod._in_monitor_window("07:30", "23:45", datetime(2026, 10, 29, 12, 0, tzinfo=tz))
+    assert not mod._in_monitor_window("07:30", "23:45", datetime(2026, 10, 29, 7, 29, tzinfo=tz))
+    assert mod._in_monitor_window("07:30", "23:45", datetime(2026, 10, 29, 23, 45, tzinfo=tz))
+    assert not mod._in_monitor_window("07:30", "23:45", datetime(2026, 10, 29, 23, 46, tzinfo=tz))
+
+
+def test_default_refresh_is_5_min():
+    p = mod.HomeConnectPlugin({})
+    assert p.validate_config({"refresh_seconds": 300}) == []

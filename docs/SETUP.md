@@ -51,3 +51,23 @@ curl -X POST http://localhost:4420/api/plugins/install \
 ```
 
 Plugin id: `home_connect` · Author: **peterdgreenway**
+
+
+## Refresh now
+
+1. Turn **Run refresh now** ON  
+2. **Save Changes** — fetches immediately (even outside the monitoring window)
+
+## Auto refresh
+
+Default interval: **300 seconds (5 minutes)** while monitoring is active.  
+Align FiestaBoard page/plugin refresh with `suggested_refresh_seconds`.
+
+## Monitoring window (UK local)
+
+| Setting | Default |
+|---------|---------|
+| Start | **07:30** |
+| Stop | **23:45** |
+
+Outside the window the plugin shows `outside hours` and does not call the API unless **Run refresh now** is used.

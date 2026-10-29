@@ -1,8 +1,8 @@
 {
   "id": "home_connect",
   "name": "Home Connect",
-  "version": "1.0.0",
-  "description": "Bosch/Siemens Home Connect appliance status for Vestaboard Note. Up to 5 appliances; encrypted login; AI-style abridged status lines.",
+  "version": "1.1.0",
+  "description": "Home Connect status for Vestaboard Note (up to 5 appliances). Refresh now + every n seconds (default 300). Monitor window 07:30\u201323:45.",
   "author": "peterdgreenway",
   "icon": "home",
   "category": "data",
@@ -34,6 +34,38 @@
   "settings_schema": {
     "type": "object",
     "properties": {
+      "run_refresh_now": {
+        "type": "boolean",
+        "title": "Run refresh now",
+        "description": "Turn ON and Save Changes to fetch appliance status immediately (ignores monitoring window).",
+        "default": false
+      },
+      "refresh_seconds": {
+        "type": "integer",
+        "title": "Auto refresh interval (seconds)",
+        "description": "How often to refresh while inside the monitoring window. Default 300 (5 minutes).",
+        "default": 300,
+        "minimum": 60,
+        "maximum": 3600
+      },
+      "monitor_window_enabled": {
+        "type": "boolean",
+        "title": "Enable monitoring time window",
+        "description": "When on, live polling runs only between start and end times (UK local).",
+        "default": true
+      },
+      "monitor_start": {
+        "type": "string",
+        "title": "Monitoring start time",
+        "description": "HH:MM local (default 07:30).",
+        "default": "07:30"
+      },
+      "monitor_end": {
+        "type": "string",
+        "title": "Monitoring stop time",
+        "description": "HH:MM local (default 23:45).",
+        "default": "23:45"
+      },
       "username": {
         "type": "string",
         "title": "Home Connect user identity (email)",
@@ -88,13 +120,6 @@
         "title": "Appliance name filter (optional)",
         "description": "Comma-separated name/type substrings to include. Max 5 devices after filter.",
         "default": ""
-      },
-      "refresh_seconds": {
-        "type": "integer",
-        "title": "Refresh Interval (seconds)",
-        "default": 120,
-        "minimum": 60,
-        "maximum": 3600
       }
     }
   },
@@ -144,7 +169,14 @@
       "appliance_5_note_block",
       "appliance_5_note_row1",
       "appliance_5_note_row2",
-      "appliance_5_note_row3"
+      "appliance_5_note_row3",
+      "run_refresh_now",
+      "refresh_seconds",
+      "suggested_refresh_seconds",
+      "refresh_mode",
+      "monitor_window_active",
+      "monitor_start",
+      "monitor_end"
     ],
     "arrays": {
       "appliances": {

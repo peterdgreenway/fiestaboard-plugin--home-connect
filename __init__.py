@@ -42,6 +42,40 @@ BLUE = "{67}"
 VIOLET = "{68}"
 WHITE = "{69}"
 
+
+def _parse_hhmm(value: str, default: str) -> tuple:
+    raw = (value or default).strip().replace(".", ":")
+    parts = raw.split(":")
+    try:
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+        return h, m
+    except (ValueError, IndexError):
+        dh, dm = default.replace(".", ":").split(":")
+        return int(dh), int(dm)
+
+
+def _in_monitor_window(start: str, end: str, now=None) -> bool:
+    """True if local time is within start–end (default 07:30–23:45)."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = now or datetime.now(ZoneInfo("Europe/London"))
+        if getattr(now, "tzinfo", None) is None:
+            now = now.replace(tzinfo=ZoneInfo("Europe/London"))
+    except Exception:
+        now = now or datetime.now(timezone.utc)
+    sh, sm = _parse_hhmm(start, "07:30")
+    eh, em = _parse_hhmm(end, "23:45")
+    cur = now.hour * 60 + now.minute
+    s = sh * 60 + sm
+    e = eh * 60 + em
+    if s <= e:
+        return s <= cur <= e
+    return cur >= s or cur <= e
+
+
 # Short replacements for status abridgment
 _ABBREV = [
     (r"\boperation state\b", "state"),
@@ -210,13 +244,28 @@ class HomeConnectPlugin(PluginBase):
 
     def validate_config(self, config: Dict[str, Any]) -> List[str]:
         errors: List[str] = []
-        refresh = config.get("refresh_seconds", 120)
+        refresh = config.get("refresh_seconds", 300)
         if not isinstance(refresh, int) or refresh < 60:
-            errors.append("refresh_seconds must be an integer >= 60")
+            errors.append("refresh_seconds must be an integer >= 60 (default 300 = 5 minutes)")
+        if "run_refresh_now" in config and not isinstance(config["run_refresh_now"], bool):
+            errors.append("run_refresh_now must be a boolean")
+        if "monitor_window_enabled" in config and not isinstance(
+            config["monitor_window_enabled"], bool
+        ):
+            errors.append("monitor_window_enabled must be a boolean")
+        for key, default in (("monitor_start", "07:30"), ("monitor_end", "23:45")):
+            val = config.get(key, default)
+            if not isinstance(val, str):
+                errors.append(f"{key} must be HH:MM")
+                continue
+            try:
+                _parse_hhmm(val, default)
+            except Exception:
+                errors.append(f"{key} must be HH:MM (e.g. 07:30)")
         return errors
 
     def on_config_change(self, old_config: Dict[str, Any], new_config: Dict[str, Any]) -> None:
-        """Encrypt secrets on save; clear cache."""
+        """Encrypt secrets on save; clear cache (supports Run refresh now)."""
         try:
             changed = False
             for key in ("password", "client_secret", "refresh_token"):
@@ -354,9 +403,54 @@ class HomeConnectPlugin(PluginBase):
 
     def fetch_data(self) -> PluginResult:
         try:
+            force = bool(self.config.get("run_refresh_now", False))
+            start = str(self.config.get("monitor_start", "07:30") or "07:30")
+            end = str(self.config.get("monitor_end", "23:45") or "23:45")
+            window_enabled = bool(self.config.get("monitor_window_enabled", True))
+            in_window = (not window_enabled) or _in_monitor_window(start, end)
+            refresh_seconds = int(self.config.get("refresh_seconds", 300) or 300)
+
+            # Outside monitoring window: skip live API unless forced
+            if not in_window and not force:
+                data = {
+                    "appliance_count": "0",
+                    "name": "Home",
+                    "status": "outside hours",
+                    "detail": f"{start}-{end}",
+                    "monitor_window_active": "NO",
+                    "monitor_start": start,
+                    "monitor_end": end,
+                    "run_refresh_now": "NO",
+                    "refresh_seconds": str(refresh_seconds),
+                    "refresh_mode": "OUTSIDE",
+                    "suggested_refresh_seconds": str(refresh_seconds),
+                    "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                }
+                block, r1, r2, r3 = abridge_note_block("Home", "outside hours", f"{start}-{end}")
+                data.update({
+                    "note_row1": r1, "note_row2": r2, "note_row3": r3, "note_block": block,
+                })
+                for i in range(MAX_APPLIANCES):
+                    data[f"appliance_{i+1}_name"] = ""
+                    data[f"appliance_{i+1}_status"] = ""
+                    data[f"appliance_{i+1}_detail"] = ""
+                    data[f"appliance_{i+1}_note_block"] = ""
+                    data[f"appliance_{i+1}_note_row1"] = ""
+                    data[f"appliance_{i+1}_note_row2"] = ""
+                    data[f"appliance_{i+1}_note_row3"] = ""
+                return PluginResult(available=True, data=data)
+
             # Demo mode without credentials
             if bool(self.config.get("demo_mode", False)):
-                return PluginResult(available=True, data=self._demo_data())
+                data = self._demo_data()
+                data["monitor_window_active"] = "YES" if in_window else "NO"
+                data["monitor_start"] = start
+                data["monitor_end"] = end
+                data["run_refresh_now"] = "YES" if force else "NO"
+                data["refresh_seconds"] = str(refresh_seconds)
+                data["refresh_mode"] = "FORCED" if force else "ACTIVE"
+                data["suggested_refresh_seconds"] = str(refresh_seconds)
+                return PluginResult(available=True, data=data)
 
             token = self._get_token()
             appliances = self._list_appliances(token)
@@ -466,6 +560,13 @@ class HomeConnectPlugin(PluginBase):
                     data[f"appliance_{i+1}_note_row3"] = ""
 
             data["username"] = (self.config.get("username") or "")[:40]
+            data["monitor_window_active"] = "YES" if in_window else "NO"
+            data["monitor_start"] = start
+            data["monitor_end"] = end
+            data["run_refresh_now"] = "YES" if force else "NO"
+            data["refresh_seconds"] = str(refresh_seconds)
+            data["refresh_mode"] = "FORCED" if force else "ACTIVE"
+            data["suggested_refresh_seconds"] = str(refresh_seconds)
             return PluginResult(available=True, data=data)
         except Exception as e:
             logger.exception("home_connect error")
