@@ -556,6 +556,7 @@ class HomeConnectPlugin(PluginBase):
             "exchange_authorization_code",
             "get_oauth_tokens",
             "clear_stored_tokens",
+            "debug_log_secrets",
         ):
             if key in config and not isinstance(config[key], bool):
                 errors.append(f"{key} must be a boolean")
@@ -598,6 +599,64 @@ class HomeConnectPlugin(PluginBase):
         except Exception as e:
             logger.warning("on_config_change: %s", e)
 
+
+    @staticmethod
+    def _redact_secret(value: str, keep: int = 6) -> str:
+        """Safe preview for debug logs (not full token)."""
+        if not value:
+            return "(empty)"
+        if len(value) <= keep * 2:
+            return value[:2] + "…" + value[-2:] if len(value) > 4 else "****"
+        return f"{value[:keep]}…{value[-keep:]} (len={len(value)})"
+
+    def _prepare_credentials(self) -> Dict[str, str]:
+        """Decrypt all secret settings for this refresh cycle (manual or automatic).
+
+        Values are returned in plaintext for API use only; config stays encrypted at rest.
+        Debug logs show redacted previews only (never full secrets).
+        """
+        secret_keys = (
+            "fiestaboard_client_secret",
+            "client_secret",
+            "refresh_token",
+            "id_token",
+            "access_token",
+            "stored_refresh_token",
+            "stored_access_token",
+        )
+        out: Dict[str, str] = {}
+        verbose = bool(self.config.get("debug_log_secrets", False))
+        for key in secret_keys:
+            raw = str(self.config.get(key) or "")
+            if not raw:
+                out[key] = ""
+                logger.debug("Home Connect decrypt %s: (not set)", key)
+                continue
+            was_encrypted = raw.startswith(("enc:", "obf:"))
+            plain = decrypt_secret(raw)
+            out[key] = plain if plain is not None else ""
+            if was_encrypted and not out[key]:
+                logger.warning(
+                    "Home Connect: failed to decrypt %s — check HOME_CONNECT_FERNET_KEY",
+                    key,
+                )
+            elif verbose and out[key]:
+                # Explicit opt-in: log more of the value for troubleshooting
+                logger.debug(
+                    "Home Connect decrypt %s [verbose]: stored=%s plain=%s",
+                    key,
+                    "encrypted" if was_encrypted else "plaintext",
+                    out[key],
+                )
+            else:
+                logger.debug(
+                    "Home Connect decrypt %s: stored=%s plain=%s",
+                    key,
+                    "encrypted" if was_encrypted else "plaintext",
+                    self._redact_secret(out[key]),
+                )
+        return out
+
     def _api_roots(self) -> Tuple[str, str, str]:
         if bool(self.config.get("use_simulator", False)):
             return SIM_API_HOST, SIM_AUTH_URL, SIM_TOKEN_URL
@@ -611,8 +670,11 @@ class HomeConnectPlugin(PluginBase):
             or api_web
             or ""
         ).strip()
-        fb_secret = decrypt_secret(
-            str(self.config.get("fiestaboard_client_secret") or self.config.get("client_secret") or "")
+        creds = getattr(self, "_creds", None) or self._prepare_credentials()
+        fb_secret = (
+            creds.get("fiestaboard_client_secret")
+            or creds.get("client_secret")
+            or ""
         )
         return api_web, fb_id, fb_secret
 
@@ -707,14 +769,16 @@ class HomeConnectPlugin(PluginBase):
 
     def _token_from_config(self, *keys: str) -> str:
         """First non-empty decrypted token among setting keys (user field then stored)."""
+        creds = getattr(self, "_creds", None)
         for key in keys:
-            raw = decrypt_secret(str(self.config.get(key) or ""))
-            if raw and not raw.startswith(("enc:", "obf:")):
-                return raw
-            # also accept plaintext not yet encrypted mid-request
-            plain = str(self.config.get(key) or "").strip()
+            if creds is not None and creds.get(key):
+                return creds[key]
+            raw = str(self.config.get(key) or "")
+            plain = decrypt_secret(raw) if raw else ""
             if plain and not plain.startswith(("enc:", "obf:")):
                 return plain
+            if raw and not raw.startswith(("enc:", "obf:")):
+                return raw.strip()
         return ""
 
     def _get_token(self) -> str:
@@ -725,7 +789,10 @@ class HomeConnectPlugin(PluginBase):
           2) id_token (used as Bearer if no refresh path)
           3) access_token
         Then: authorization code exchange, stored tokens, authorize URL error.
+
+        Always decrypts secrets first via _prepare_credentials().
         """
+        self._creds = self._prepare_credentials()
         _, fb_id, fb_secret = self._client_ids()
 
         # --- 1) refresh_token (user-entered or stored) ---
@@ -907,6 +974,9 @@ class HomeConnectPlugin(PluginBase):
 
     def fetch_data(self) -> PluginResult:
         try:
+            # Decrypt secrets before manual refresh (run_refresh_now) or automated poll
+            self._creds = self._prepare_credentials()
+
             force = bool(self.config.get("run_refresh_now", False))
             start = str(self.config.get("monitor_start", "07:30") or "07:30")
             end = str(self.config.get("monitor_end", "23:45") or "23:45")

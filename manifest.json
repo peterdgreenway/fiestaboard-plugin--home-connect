@@ -1,7 +1,7 @@
 {
   "id": "home_connect",
   "name": "Home Connect",
-  "version": "2.4.1",
+  "version": "2.4.3",
   "description": "Home Connect Note plugin. Tokens: refresh_token (1), id_token (2), access_token (3). 5-char codes, mins/seconds remaining, Authorization Code OAuth.",
   "author": "peterdgreenway",
   "icon": "home",
@@ -142,6 +142,12 @@
         "type": "string",
         "title": "OAuth scopes",
         "default": "IdentifyAppliance Monitor Control Settings"
+      },
+      "debug_log_secrets": {
+        "type": "boolean",
+        "title": "Debug: log full decrypted secrets",
+        "description": "When ON, debug logs include full decrypted token values (sensitive). When OFF (default), only redacted previews are logged at DEBUG level.",
+        "default": false
       }
     }
   },
