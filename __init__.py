@@ -554,6 +554,7 @@ class HomeConnectPlugin(PluginBase):
             "run_refresh_now",
             "monitor_window_enabled",
             "exchange_authorization_code",
+            "get_oauth_tokens",
             "clear_stored_tokens",
         ):
             if key in config and not isinstance(config[key], bool):
@@ -574,6 +575,9 @@ class HomeConnectPlugin(PluginBase):
             for key in (
                 "fiestaboard_client_secret",
                 "client_secret",
+                "refresh_token",
+                "id_token",
+                "access_token",
                 "stored_refresh_token",
                 "stored_access_token",
             ):
@@ -583,6 +587,9 @@ class HomeConnectPlugin(PluginBase):
             if bool(new_config.get("clear_stored_tokens", False)):
                 new_config["stored_refresh_token"] = ""
                 new_config["stored_access_token"] = ""
+                new_config["refresh_token"] = ""
+                new_config["id_token"] = ""
+                new_config["access_token"] = ""
                 new_config["authorization_code"] = ""
                 new_config["clear_stored_tokens"] = False
                 logger.info("Home Connect: stored tokens cleared")
@@ -651,15 +658,25 @@ class HomeConnectPlugin(PluginBase):
     def _persist_tokens(self, payload: Dict[str, Any]) -> str:
         access = payload.get("access_token") or ""
         refresh = payload.get("refresh_token") or ""
+        id_tok = payload.get("id_token") or ""
         if access:
-            self.config["stored_access_token"] = encrypt_secret(access)
+            enc = encrypt_secret(access)
+            self.config["stored_access_token"] = enc
+            self.config["access_token"] = enc
         if refresh:
-            self.config["stored_refresh_token"] = encrypt_secret(refresh)
+            enc = encrypt_secret(refresh)
+            self.config["stored_refresh_token"] = enc
+            self.config["refresh_token"] = enc
+        if id_tok:
+            self.config["id_token"] = encrypt_secret(id_tok)
         if not access:
-            raise RuntimeError(payload.get("error_description") or payload.get("error") or "no access_token")
-        # Clear one-time code after success
+            raise RuntimeError(
+                payload.get("error_description") or payload.get("error") or "no access_token"
+            )
+        # Clear one-time code / button flags after success
         self.config["authorization_code"] = ""
         self.config["exchange_authorization_code"] = False
+        self.config["get_oauth_tokens"] = False
         return access
 
     def _exchange_authorization_code(self) -> str:
@@ -688,38 +705,80 @@ class HomeConnectPlugin(PluginBase):
         payload = self._token_request(body)
         return self._persist_tokens(payload)
 
+    def _token_from_config(self, *keys: str) -> str:
+        """First non-empty decrypted token among setting keys (user field then stored)."""
+        for key in keys:
+            raw = decrypt_secret(str(self.config.get(key) or ""))
+            if raw and not raw.startswith(("enc:", "obf:")):
+                return raw
+            # also accept plaintext not yet encrypted mid-request
+            plain = str(self.config.get(key) or "").strip()
+            if plain and not plain.startswith(("enc:", "obf:")):
+                return plain
+        return ""
+
     def _get_token(self) -> str:
+        """Resolve API bearer token.
+
+        Priority when manual tokens are set:
+          1) refresh_token → exchange for access_token
+          2) id_token (used as Bearer if no refresh path)
+          3) access_token
+        Then: authorization code exchange, stored tokens, authorize URL error.
+        """
         _, fb_id, fb_secret = self._client_ids()
 
-        if bool(self.config.get("exchange_authorization_code", False)) or (
-            (self.config.get("authorization_code") or "").strip()
-            and not decrypt_secret(str(self.config.get("stored_refresh_token") or ""))
-        ):
-            if (self.config.get("authorization_code") or "").strip():
-                return self._exchange_authorization_code()
-
-        refresh = decrypt_secret(str(self.config.get("stored_refresh_token") or ""))
-        if fb_id and refresh:
+        # --- 1) refresh_token (user-entered or stored) ---
+        refresh = self._token_from_config("refresh_token", "stored_refresh_token")
+        if refresh:
             body = {
                 "grant_type": "refresh_token",
                 "refresh_token": refresh,
-                "client_id": fb_id,
+                "client_id": fb_id or "",
             }
             if fb_secret:
                 body["client_secret"] = fb_secret
-            try:
-                return self._persist_tokens(self._token_request(body))
-            except Exception as e:
-                logger.warning("refresh_token failed: %s", e)
+            if fb_id:
+                try:
+                    access = self._persist_tokens(self._token_request(body))
+                    # Keep user refresh_token field in sync if rotated
+                    return access
+                except Exception as e:
+                    logger.warning("refresh_token exchange failed: %s", e)
+            else:
+                logger.warning("refresh_token set but Fiestaboard Client ID missing")
 
-        access = decrypt_secret(str(self.config.get("stored_access_token") or ""))
+        # --- authorization code / Get tokens via OAuth button ---
+        get_tokens = bool(self.config.get("get_oauth_tokens", False))
+        exchange = bool(self.config.get("exchange_authorization_code", False))
+        has_code = bool((self.config.get("authorization_code") or "").strip())
+        if (get_tokens or exchange) and has_code:
+            return self._exchange_authorization_code()
+        if has_code and not refresh:
+            return self._exchange_authorization_code()
+
+        # --- 2) id_token ---
+        id_tok = self._token_from_config("id_token")
+        if id_tok:
+            logger.info("Home Connect: using id_token as Bearer (priority 2)")
+            return id_tok
+
+        # --- 3) access_token (user-entered or stored) ---
+        access = self._token_from_config("access_token", "stored_access_token")
         if access:
             return access
 
         auth_url = self.build_authorize_url()
+        if bool(self.config.get("get_oauth_tokens", False)):
+            raise RuntimeError(
+                "Get tokens via OAuth: open authorize_url, log in, paste code into "
+                "Authorization code, then Save again with Get tokens ON. "
+                + (auth_url or "Set Fiestaboard Client ID first.")
+            )
         raise RuntimeError(
-            "Not authorized. Open authorize_url, log in, then paste the code and "
-            "enable Exchange authorization code. URL: " + (auth_url or "(set Client ID first)")
+            "Not authorized. Enter refresh_token, id_token, or access_token, "
+            "or use Get tokens via OAuth. "
+            + (auth_url or "(set Client ID first)")
         )
 
     def _api_get(self, path: str, token: str) -> Dict[str, Any]:
@@ -808,10 +867,17 @@ class HomeConnectPlugin(PluginBase):
 
     def _auth_meta(self) -> Dict[str, str]:
         _, fb_id, fb_secret = self._client_ids()
-        has_refresh = bool(decrypt_secret(str(self.config.get("stored_refresh_token") or "")))
-        has_access = bool(decrypt_secret(str(self.config.get("stored_access_token") or "")))
+        has_refresh = bool(
+            self._token_from_config("refresh_token", "stored_refresh_token")
+        )
+        has_id = bool(self._token_from_config("id_token"))
+        has_access = bool(
+            self._token_from_config("access_token", "stored_access_token")
+        )
         if has_refresh:
             status = "AUTHORIZED"
+        elif has_id:
+            status = "ID_TOKEN"
         elif has_access:
             status = "ACCESS_ONLY"
         elif fb_id and fb_secret:
@@ -820,12 +886,22 @@ class HomeConnectPlugin(PluginBase):
             status = "NEEDS_SECRET_OR_CODE"
         else:
             status = "NEEDS_CLIENT_ID"
+        auth_url = self.build_authorize_url()
+        if status in ("NEEDS_CODE", "NEEDS_SECRET_OR_CODE", "NEEDS_CLIENT_ID"):
+            hint = "Open authorize_url, then paste code and use Get tokens via OAuth"
+        elif status == "AUTHORIZED":
+            hint = "Tokens stored — refresh_token active"
+        else:
+            hint = "Using token priority refresh > id > access"
         return {
             "oauth_flow": "authorization_code",
             "auth_status": status,
-            "authorize_url": self.build_authorize_url()[:500],
+            "authorize_url": (auth_url or "")[:500],
             "redirect_uri": self._redirect_uri()[:120],
             "has_refresh_token": "YES" if has_refresh else "NO",
+            "has_id_token": "YES" if has_id else "NO",
+            "has_access_token": "YES" if has_access else "NO",
+            "oauth_hint": hint[:80],
             "fiestaboard_client_id": (fb_id or "")[:40],
         }
 

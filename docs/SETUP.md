@@ -41,3 +41,26 @@ https://api.home-connect.com/security/oauth/authorize?response_type=code&client_
 - Up to **5** appliances · name filter · simulator · demo mode
 - **Clear stored tokens** to force re-login
 - `auth_status`: AUTHORIZED | NEEDS_CODE | …
+
+
+## Manual tokens (priority order)
+
+You may paste tokens from a Home Connect OAuth response:
+
+| Priority | Setting | Behaviour |
+|----------|---------|-----------|
+| **1** | **refresh_token** | Exchanged for a new access_token (needs Client ID + Secret) |
+| **2** | **id_token** | Used as Bearer if refresh is not available |
+| **3** | **access_token** | Used as Bearer if neither of the above applies |
+
+All three are **encrypted on Save**. **Clear stored tokens** wipes these fields too.
+
+
+## Get tokens via OAuth (button)
+
+1. Set **Fiestaboard Client ID**, **Secret**, and **Redirect URI** → Save  
+2. Open **`authorize_url`** from plugin data → log in → Allow  
+3. Copy `code` from the browser address bar into **Authorization code**  
+4. Turn **Get tokens via OAuth** **ON** → **Save**  
+5. Plugin stores **refresh_token**, **access_token**, and **id_token** (encrypted)  
+6. Turn the button **OFF** after success (it clears automatically on success)

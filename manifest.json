@@ -1,8 +1,8 @@
 {
   "id": "home_connect",
   "name": "Home Connect",
-  "version": "2.3.2",
-  "description": "Home Connect Note: 5-char codes (WASHM/DWASH/\u2026), green/red flaps, remaining minutes, focus Note block. Authorization Code OAuth.",
+  "version": "2.4.1",
+  "description": "Home Connect Note plugin. Tokens: refresh_token (1), id_token (2), access_token (3). 5-char codes, mins/seconds remaining, Authorization Code OAuth.",
   "author": "peterdgreenway",
   "icon": "home",
   "category": "data",
@@ -42,6 +42,27 @@
         "default": "",
         "ui:widget": "password"
       },
+      "refresh_token": {
+        "type": "string",
+        "title": "refresh_token",
+        "description": "Priority 1. Used to obtain a new access_token from Home Connect. Encrypted on Save.",
+        "default": "",
+        "ui:widget": "password"
+      },
+      "id_token": {
+        "type": "string",
+        "title": "id_token",
+        "description": "Priority 2. Used as Bearer if refresh_token is missing or fails. Encrypted on Save.",
+        "default": "",
+        "ui:widget": "password"
+      },
+      "access_token": {
+        "type": "string",
+        "title": "access_token",
+        "description": "Priority 3. Direct API Bearer token if refresh_token and id_token are not used. Encrypted on Save.",
+        "default": "",
+        "ui:widget": "password"
+      },
       "redirect_uri": {
         "type": "string",
         "title": "Redirect URI",
@@ -54,6 +75,12 @@
         "description": "After login, paste the code= value from the browser address bar, or the full redirect URL.",
         "default": "",
         "ui:widget": "password"
+      },
+      "get_oauth_tokens": {
+        "type": "boolean",
+        "title": "Get tokens via OAuth",
+        "description": "Step 1: Save with Client ID/Secret/Redirect URI, open authorize_url, log in. Step 2: Paste the ?code= into Authorization code, turn this ON, Save \u2014 stores refresh_token, access_token, and id_token (encrypted).",
+        "default": false
       },
       "exchange_authorization_code": {
         "type": "boolean",
@@ -246,7 +273,10 @@
       "appliance_2_remaining_seconds",
       "appliance_3_remaining_seconds",
       "appliance_4_remaining_seconds",
-      "appliance_5_remaining_seconds"
+      "appliance_5_remaining_seconds",
+      "has_id_token",
+      "has_access_token",
+      "oauth_hint"
     ],
     "arrays": {
       "appliances": {
