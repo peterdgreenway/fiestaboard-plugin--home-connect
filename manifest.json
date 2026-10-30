@@ -1,8 +1,8 @@
 {
   "id": "home_connect",
   "name": "Home Connect",
-  "version": "2.3.0",
-  "description": "Home Connect Note: 5-char codes (WASHM/DWASH/\u2026), green/red flaps, remaining minutes, focus Note block. Authorization Code OAuth.",
+  "version": "2.2.1",
+  "description": "Home Connect on Vestaboard Note. Authorization Code OAuth. Labels: API Web Client ID, Fiestaboard Client ID/Secret. Refresh now, 5\u2011min poll, 07:30\u201323:45 window, up to 5 appliances.",
   "author": "peterdgreenway",
   "icon": "home",
   "category": "data",
@@ -206,41 +206,7 @@
       "appliance_5_status_indicator",
       "appliance_5_status_indicator_name",
       "appliance_5_status_indicator_label",
-      "appliance_5_status_indicator_pair",
-      "code",
-      "is_on",
-      "remaining_minutes",
-      "summary_line",
-      "board_summary",
-      "focus_note_block",
-      "focus_note_row1",
-      "focus_note_row2",
-      "focus_note_row3",
-      "appliance_1_code",
-      "appliance_1_is_on",
-      "appliance_1_remaining_minutes",
-      "appliance_1_summary_line",
-      "appliance_1_focus_note_block",
-      "appliance_2_code",
-      "appliance_2_is_on",
-      "appliance_2_remaining_minutes",
-      "appliance_2_summary_line",
-      "appliance_2_focus_note_block",
-      "appliance_3_code",
-      "appliance_3_is_on",
-      "appliance_3_remaining_minutes",
-      "appliance_3_summary_line",
-      "appliance_3_focus_note_block",
-      "appliance_4_code",
-      "appliance_4_is_on",
-      "appliance_4_remaining_minutes",
-      "appliance_4_summary_line",
-      "appliance_4_focus_note_block",
-      "appliance_5_code",
-      "appliance_5_is_on",
-      "appliance_5_remaining_minutes",
-      "appliance_5_summary_line",
-      "appliance_5_focus_note_block"
+      "appliance_5_status_indicator_pair"
     ],
     "arrays": {
       "appliances": {
@@ -262,12 +228,7 @@
           "status_indicator",
           "status_indicator_name",
           "status_indicator_label",
-          "status_indicator_pair",
-          "code",
-          "is_on",
-          "remaining_minutes",
-          "summary_line",
-          "focus_note_block"
+          "status_indicator_pair"
         ]
       }
     }
