@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,7 +32,33 @@ logger = logging.getLogger(__name__)
 
 NOTE_WIDTH = 15
 MAX_APPLIANCES = 5
-UA = "FiestaBoard-HomeConnect/2.1 (+https://fiestaboard.app)"
+UA = "FiestaBoard-HomeConnect/2.5 (+https://fiestaboard.app)"
+
+# ---- Rate limit / cache (process memory; survives within container life) ----
+_RATE_LIMIT: Dict[str, Any] = {
+    "suspended_until": 0.0,  # unix time
+    "last_429_message": "",
+}
+_TOKEN_CACHE: Dict[str, Any] = {
+    "access_token": "",
+    "expires_at": 0.0,  # unix time
+}
+_DATA_CACHE: Dict[str, Any] = {
+    "fetched_at": 0.0,
+    "data": None,  # last successful PluginResult data dict
+    "fingerprint": "",  # optional change detection
+}
+MIN_POLL_SECONDS = 300  # max once per 5 minutes
+TOKEN_REFRESH_SKEW = 120  # refresh access token 2 min before expiry
+
+
+class HomeConnectRateLimitError(Exception):
+    """HTTP 429 — daily or short-term rate limit."""
+
+    def __init__(self, message: str, retry_after: int = 3600):
+        super().__init__(message)
+        self.retry_after = max(60, int(retry_after))
+
 
 API_HOST = "https://api.home-connect.com"
 AUTH_URL = "https://api.home-connect.com/security/oauth/authorize"
@@ -548,8 +575,10 @@ class HomeConnectPlugin(PluginBase):
     def validate_config(self, config: Dict[str, Any]) -> List[str]:
         errors: List[str] = []
         refresh = config.get("refresh_seconds", 300)
-        if not isinstance(refresh, int) or refresh < 60:
-            errors.append("refresh_seconds must be an integer >= 60")
+        if not isinstance(refresh, int) or refresh < MIN_POLL_SECONDS:
+            errors.append(
+                f"refresh_seconds must be an integer >= {MIN_POLL_SECONDS} (5 minutes max frequency)"
+            )
         for key in (
             "run_refresh_now",
             "monitor_window_enabled",
@@ -848,7 +877,34 @@ class HomeConnectPlugin(PluginBase):
             + (auth_url or "(set Client ID first)")
         )
 
+    def _rate_limit_active(self) -> bool:
+        return time.time() < float(_RATE_LIMIT.get("suspended_until") or 0)
+
+    def _suspend_for_429(self, retry_after: int, message: str = "") -> None:
+        wait = max(60, int(retry_after))
+        # Daily limit: back off until next UTC midnight + small buffer if message says 1 day
+        low = (message or "").lower()
+        if "1 day" in low or "1000" in low or "daily" in low:
+            # Suspend until next UTC midnight
+            now = time.time()
+            # seconds until next UTC midnight
+            gm = time.gmtime(now)
+            elapsed = gm.tm_hour * 3600 + gm.tm_min * 60 + gm.tm_sec
+            wait = max(wait, 86400 - elapsed + 60)
+        _RATE_LIMIT["suspended_until"] = time.time() + wait
+        _RATE_LIMIT["last_429_message"] = (message or "")[:200]
+        logger.warning(
+            "Home Connect rate limited — suspending API calls for %ss until %s",
+            wait,
+            time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(_RATE_LIMIT["suspended_until"])),
+        )
+
     def _api_get(self, path: str, token: str) -> Dict[str, Any]:
+        if self._rate_limit_active():
+            raise HomeConnectRateLimitError(
+                _RATE_LIMIT.get("last_429_message") or "rate limit suspension active",
+                retry_after=max(1, int(_RATE_LIMIT["suspended_until"] - time.time())),
+            )
         host, _, _ = self._api_roots()
         req = urllib.request.Request(
             host.rstrip("/") + path,
@@ -858,8 +914,21 @@ class HomeConnectPlugin(PluginBase):
                 "User-Agent": UA,
             },
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+            if e.code == 429:
+                retry_after = 3600
+                if e.headers and e.headers.get("Retry-After"):
+                    try:
+                        retry_after = int(e.headers.get("Retry-After"))
+                    except ValueError:
+                        pass
+                self._suspend_for_429(retry_after, body)
+                raise HomeConnectRateLimitError(body or "HTTP 429", retry_after=retry_after) from e
+            raise RuntimeError(f"API {path} HTTP {e.code}: {body}") from e
 
     def _list_appliances(self, token: str) -> List[Dict[str, Any]]:
         data = self._api_get("/api/homeappliances", token)
@@ -873,39 +942,52 @@ class HomeConnectPlugin(PluginBase):
             logger.warning("status %s: %s", ha_id, e)
             return []
 
-    def _appliance_time_items(self, token: str, ha_id: str) -> List[Dict[str, Any]]:
-        """Collect status + active program options (RemainingProgramTime lives here)."""
+    def _operation_looks_active(self, status_items: List[Dict[str, Any]]) -> bool:
+        for it in status_items or []:
+            key = str(it.get("key") or "")
+            val = str(it.get("displayvalue") or it.get("value") or "").lower()
+            if "OperationState" in key:
+                if any(x in val for x in ("run", "active", "delayed", "pause", "action")):
+                    return True
+                if any(x in val for x in ("ready", "inactive", "off", "finished")):
+                    return False
+        return False
+
+    def _appliance_time_items(
+        self,
+        token: str,
+        ha_id: str,
+        status_items: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Status + active program options only when the appliance looks active.
+
+        Avoids 2 extra API calls per idle device (major rate-limit saver).
+        """
         items: List[Dict[str, Any]] = []
-        items.extend(self._appliance_status(token, ha_id))
+        if status_items is None:
+            status_items = self._appliance_status(token, ha_id)
+        items.extend(status_items)
+        if not self._operation_looks_active(status_items):
+            return items
         try:
             data = self._api_get(f"/api/homeappliances/{ha_id}/programs/active", token)
             prog = (data.get("data") or {}) if isinstance(data, dict) else {}
-            # options may be under data.options
             opts = prog.get("options") or []
             if isinstance(opts, list):
                 items.extend(opts)
-            # some payloads nest key/value at top level
-            if prog.get("key") and "remaining" in str(prog.get("key")).lower():
-                items.append(prog)
+            # Options are often already embedded — only call /options if none present
+            if not opts:
+                try:
+                    data2 = self._api_get(
+                        f"/api/homeappliances/{ha_id}/programs/active/options", token
+                    )
+                    opts2 = (data2.get("data") or {}).get("options") or data2.get("data") or []
+                    if isinstance(opts2, list):
+                        items.extend(opts2)
+                except Exception as e:
+                    logger.debug("active options %s: %s", ha_id, e)
         except Exception as e:
-            # No active program is common when appliance is off
             logger.debug("active program %s: %s", ha_id, e)
-        try:
-            data = self._api_get(
-                f"/api/homeappliances/{ha_id}/programs/active/options", token
-            )
-            opts = (data.get("data") or {}).get("options") or data.get("data") or []
-            if isinstance(opts, list):
-                items.extend(opts)
-            elif isinstance(opts, dict):
-                # single option map
-                for k, v in opts.items():
-                    if isinstance(v, dict):
-                        items.append({"key": v.get("key") or k, **v})
-                    else:
-                        items.append({"key": k, "value": v})
-        except Exception as e:
-            logger.debug("active options %s: %s", ha_id, e)
         return items
 
     def _pick_status_summary(self, items: List[Dict[str, Any]]) -> Tuple[str, str]:
@@ -983,6 +1065,10 @@ class HomeConnectPlugin(PluginBase):
             window_enabled = bool(self.config.get("monitor_window_enabled", True))
             in_window = (not window_enabled) or _in_monitor_window(start, end)
             refresh_seconds = int(self.config.get("refresh_seconds", 300) or 300)
+            # Enforce maximum poll frequency: once per 5 minutes (unless forced)
+            min_poll = max(MIN_POLL_SECONDS, refresh_seconds)
+            refresh_seconds = max(refresh_seconds, MIN_POLL_SECONDS)
+
             meta = {
                 **self._auth_meta(),
                 "monitor_window_active": "YES" if in_window else "NO",
@@ -991,7 +1077,79 @@ class HomeConnectPlugin(PluginBase):
                 "run_refresh_now": "YES" if force else "NO",
                 "refresh_seconds": str(refresh_seconds),
                 "suggested_refresh_seconds": str(refresh_seconds),
+                "min_poll_seconds": str(MIN_POLL_SECONDS),
+                "rate_limit_suspended": "YES" if self._rate_limit_active() else "NO",
+                "cache_age_seconds": str(
+                    int(time.time() - float(_DATA_CACHE.get("fetched_at") or 0))
+                    if _DATA_CACHE.get("fetched_at")
+                    else ""
+                ),
             }
+
+            def _with_cache_flags(data: Dict[str, Any], *, from_cache: bool, stale: bool = False) -> Dict[str, Any]:
+                data = dict(data)
+                data.update(meta)
+                data["data_from_cache"] = "YES" if from_cache else "NO"
+                data["data_stale"] = "YES" if stale else "NO"
+                if _DATA_CACHE.get("fetched_at"):
+                    data["cache_fetched_at"] = time.strftime(
+                        "%Y-%m-%d %H:%M:%S UTC",
+                        time.gmtime(float(_DATA_CACHE["fetched_at"])),
+                    )
+                return data
+
+            def _serve_cache(stale: bool = False, error: str = "") -> Optional[PluginResult]:
+                cached = _DATA_CACHE.get("data")
+                if not cached:
+                    return None
+                data = _with_cache_flags(cached, from_cache=True, stale=stale)
+                if error:
+                    data["api_warning"] = error[:120]
+                return PluginResult(available=True, data=data)
+
+            # Rate-limit suspension: never hit the API; show last good values
+            if self._rate_limit_active() and not bool(self.config.get("get_oauth_tokens")):
+                remaining = int(_RATE_LIMIT["suspended_until"] - time.time())
+                msg = f"rate limited; retry in {remaining}s"
+                cached = _serve_cache(stale=True, error=msg)
+                if cached:
+                    return cached
+                block, r1, r2, r3 = abridge_note_block("Home", "rate limit", f"{remaining}s")
+                return PluginResult(
+                    available=True,
+                    data={
+                        **meta,
+                        "name": "Home",
+                        "status": "rate limit",
+                        "detail": f"{remaining}s",
+                        "note_row1": r1,
+                        "note_row2": r2,
+                        "note_row3": r3,
+                        "note_block": block,
+                        "data_from_cache": "NO",
+                        "data_stale": "YES",
+                        "api_warning": msg,
+                    },
+                )
+
+            # Fresh cache within min_poll (skip network) unless Run refresh now / OAuth
+            cache_age = time.time() - float(_DATA_CACHE.get("fetched_at") or 0)
+            oauth_force = bool(
+                self.config.get("get_oauth_tokens")
+                or self.config.get("exchange_authorization_code")
+            )
+            if (
+                not force
+                and not oauth_force
+                and _DATA_CACHE.get("data")
+                and cache_age < min_poll
+            ):
+                logger.debug(
+                    "Home Connect: serving cache (age %ss < min_poll %ss)",
+                    int(cache_age),
+                    min_poll,
+                )
+                return _serve_cache(stale=False)
 
             if not in_window and not force:
                 block, r1, r2, r3 = abridge_note_block("Home", "outside hours", f"{start}-{end}")
@@ -1042,7 +1200,11 @@ class HomeConnectPlugin(PluginBase):
                 if connected:
                     online += 1
                 status_items = self._appliance_status(token, ha_id) if ha_id else []
-                time_items = self._appliance_time_items(token, ha_id) if ha_id else list(status_items)
+                time_items = (
+                    self._appliance_time_items(token, ha_id, status_items)
+                    if ha_id
+                    else list(status_items)
+                )
                 primary, detail = self._pick_status_summary(status_items)
                 if not connected:
                     primary = "offline"
@@ -1168,10 +1330,44 @@ class HomeConnectPlugin(PluginBase):
                 }
 
             data = self._empty_appliances(data, rows)
+            data = _with_cache_flags(data, from_cache=False, stale=False)
+            _DATA_CACHE["data"] = dict(data)
+            _DATA_CACHE["fetched_at"] = time.time()
             return PluginResult(available=True, data=data)
 
+        except HomeConnectRateLimitError as e:
+            logger.warning("Home Connect rate limit: %s", e)
+            cached = _DATA_CACHE.get("data")
+            if cached:
+                data = dict(cached)
+                data["data_from_cache"] = "YES"
+                data["data_stale"] = "YES"
+                data["api_warning"] = str(e)[:120]
+                data["rate_limit_suspended"] = "YES"
+                return PluginResult(available=True, data=data)
+            block, r1, r2, r3 = abridge_note_block("Home", "rate limit", abridge_status(str(e), 15))
+            return PluginResult(
+                available=True,
+                error=str(e)[:160],
+                data={
+                    "note_row1": r1,
+                    "note_row2": r2,
+                    "note_row3": r3,
+                    "note_block": block,
+                    "status": "rate limit",
+                    "data_stale": "YES",
+                },
+            )
         except Exception as e:
             logger.exception("home_connect error")
+            # Prefer last good appliance snapshot over hard failure
+            cached = _DATA_CACHE.get("data")
+            if cached and "Not authorized" not in str(e):
+                data = dict(cached)
+                data["data_from_cache"] = "YES"
+                data["data_stale"] = "YES"
+                data["api_warning"] = str(e)[:120]
+                return PluginResult(available=True, data=data)
             msg = str(e)
             block, r1, r2, r3 = abridge_note_block("Home", "auth needed" if "Not authorized" in msg else "error", abridge_status(msg, 15))
             data = {

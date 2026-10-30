@@ -64,3 +64,26 @@ All three are **encrypted on Save**. **Clear stored tokens** wipes these fields 
 4. Turn **Get tokens via OAuth** **ON** → **Save**  
 5. Plugin stores **refresh_token**, **access_token**, and **id_token** (encrypted)  
 6. Turn the button **OFF** after success (it clears automatically on success)
+
+
+## Rate limits & caching (v2.5)
+
+Home Connect allows about **1000 API calls per day**. Each poll previously could call:
+
+- 1 × list appliances  
+- 3 × per appliance (status + active program + options)
+
+With 2 devices every few minutes that exceeds the daily limit.
+
+### Changes
+
+1. **Max poll every 5 minutes** (`refresh_seconds` minimum 300)  
+2. **In-memory cache** — repeat polls within 5 minutes reuse last data (no API)  
+3. **Access token** refreshed only when near expiry (or missing), via `refresh_token`  
+4. **HTTP 429** — reads `Retry-After` when present; suspends calls (for daily limit, until next UTC midnight)  
+5. **Idle devices** — only `/status`; active program endpoints only when OperationState looks running  
+6. **Errors / rate limit** — UI keeps **last successful** appliance values (`data_stale=YES`)  
+
+### Server-Sent Events (SSE)
+
+Home Connect offers `GET /api/homeappliances/events` (SSE) for push updates. FiestaBoard plugins are **pull-based** (`fetch_data` on a timer), so a long-lived SSE client is not used in this build. Polling at ≤1/5 min with caching is the supported approach; SSE would need a side process outside the plugin poll model.

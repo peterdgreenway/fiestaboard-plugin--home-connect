@@ -1,8 +1,8 @@
 {
   "id": "home_connect",
   "name": "Home Connect",
-  "version": "2.4.3",
-  "description": "Home Connect Note plugin. Tokens: refresh_token (1), id_token (2), access_token (3). 5-char codes, mins/seconds remaining, Authorization Code OAuth.",
+  "version": "2.5.0",
+  "description": "Home Connect (washer/dishwasher). Max poll 5 min, response cache, token refresh only when needed, HTTP 429 backoff, last-good data on errors.",
   "author": "peterdgreenway",
   "icon": "home",
   "category": "data",
@@ -103,9 +103,9 @@
       "refresh_seconds": {
         "type": "integer",
         "title": "Auto refresh interval (seconds)",
-        "description": "Default 300 (5 minutes).",
+        "description": "Minimum and default 300 (5 minutes). Faster polling is blocked to stay under Home Connect rate limits.",
         "default": 300,
-        "minimum": 60,
+        "minimum": 300,
         "maximum": 3600
       },
       "monitor_window_enabled": {
@@ -282,7 +282,14 @@
       "appliance_5_remaining_seconds",
       "has_id_token",
       "has_access_token",
-      "oauth_hint"
+      "oauth_hint",
+      "data_from_cache",
+      "data_stale",
+      "api_warning",
+      "rate_limit_suspended",
+      "min_poll_seconds",
+      "cache_age_seconds",
+      "cache_fetched_at"
     ],
     "arrays": {
       "appliances": {
