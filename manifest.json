@@ -1,7 +1,7 @@
 {
   "id": "home_connect",
   "name": "Home Connect",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "description": "Home Connect: 5-min poll, discovery cache 6h, programme calls only when needed, hard 900 API calls/day budget, last-good data on 429.",
   "author": "peterdgreenway",
   "icon": "home",
@@ -148,6 +148,14 @@
         "title": "Debug: log full decrypted secrets",
         "description": "When ON, debug logs include full decrypted token values (sensitive). When OFF (default), only redacted previews are logged at DEBUG level.",
         "default": false
+      },
+      "max_stale_cache_seconds": {
+        "type": "integer",
+        "title": "Max age of stale cached data (seconds)",
+        "description": "Do not display cached appliance data older than this. Default 21600 (6 hours). Min 300, max 86400.",
+        "default": 21600,
+        "minimum": 300,
+        "maximum": 86400
       }
     }
   },
@@ -303,7 +311,8 @@
       "api_usage_indicator",
       "api_usage_indicator_name",
       "state_file",
-      "token_expires_at"
+      "token_expires_at",
+      "max_stale_cache_seconds"
     ],
     "arrays": {
       "appliances": {

@@ -59,6 +59,10 @@ _API_BUDGET: Dict[str, Any] = {
 MIN_POLL_SECONDS = 300  # max full status poll once per 5 minutes
 DISCOVERY_TTL_SECONDS = 6 * 3600  # re-list appliances at most every 6 hours
 DAILY_API_BUDGET = 900  # hard stop before Home Connect's ~1000/day
+MAX_STALE_CACHE_SECONDS = 6 * 3600  # do not serve appliance cache older than 6 hours
+HTTP_RETRY_STATUS = (500, 502, 503, 504)
+HTTP_RETRY_MAX = 3
+HTTP_RETRY_BACKOFF_SEC = 1.5
 TOKEN_REFRESH_SKEW = 120  # 2-minute safety margin before access_token expiry
 _STATE_LOADED = False
 
@@ -817,6 +821,11 @@ class HomeConnectPlugin(PluginBase):
             errors.append(
                 f"refresh_seconds must be an integer >= {MIN_POLL_SECONDS} (5 minutes max frequency)"
             )
+        stale = config.get("max_stale_cache_seconds", MAX_STALE_CACHE_SECONDS)
+        if stale is not None and (
+            not isinstance(stale, int) or stale < 300 or stale > 86400
+        ):
+            errors.append("max_stale_cache_seconds must be 300–86400 (default 21600 = 6h)")
         for key in (
             "run_refresh_now",
             "monitor_window_enabled",
@@ -1124,6 +1133,27 @@ class HomeConnectPlugin(PluginBase):
             + (auth_url or "(set Client ID first)")
         )
 
+    def _cache_age_seconds(self) -> Optional[float]:
+        ts = float(_DATA_CACHE.get("fetched_at") or 0)
+        if not ts:
+            return None
+        return time.time() - ts
+
+    def _cache_is_fresh_enough(self, max_age: Optional[float] = None) -> bool:
+        """True if last successful snapshot exists and is under max stale age."""
+        age = self._cache_age_seconds()
+        if age is None or not _DATA_CACHE.get("data"):
+            return False
+        limit = float(max_age if max_age is not None else MAX_STALE_CACHE_SECONDS)
+        # Allow config override
+        try:
+            cfg = int(self.config.get("max_stale_cache_seconds") or 0)
+            if cfg >= 300:
+                limit = float(cfg)
+        except (TypeError, ValueError):
+            pass
+        return age <= limit
+
     def _rate_limit_active(self) -> bool:
         return time.time() < float(_RATE_LIMIT.get("suspended_until") or 0)
 
@@ -1193,23 +1223,57 @@ class HomeConnectPlugin(PluginBase):
                 "User-Agent": UA,
             },
         )
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-                self._budget_consume(1)
-                return body
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")[:500]
-            if e.code == 429:
-                retry_after = 3600
-                if e.headers and e.headers.get("Retry-After"):
-                    try:
-                        retry_after = int(e.headers.get("Retry-After"))
-                    except ValueError:
-                        pass
-                self._suspend_for_429(retry_after, body)
-                raise HomeConnectRateLimitError(body or "HTTP 429", retry_after=retry_after) from e
-            raise RuntimeError(f"API {path} HTTP {e.code}: {body}") from e
+        last_err: Optional[Exception] = None
+        for attempt in range(1, HTTP_RETRY_MAX + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                    self._budget_consume(1)
+                    return body
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace")[:500]
+                if e.code == 429:
+                    retry_after = 3600
+                    if e.headers and e.headers.get("Retry-After"):
+                        try:
+                            retry_after = int(e.headers.get("Retry-After"))
+                        except ValueError:
+                            pass
+                    self._suspend_for_429(retry_after, body)
+                    raise HomeConnectRateLimitError(
+                        body or "HTTP 429", retry_after=retry_after
+                    ) from e
+                if e.code in HTTP_RETRY_STATUS and attempt < HTTP_RETRY_MAX:
+                    delay = HTTP_RETRY_BACKOFF_SEC * attempt
+                    logger.warning(
+                        "Home Connect HTTP %s on %s (attempt %s/%s) — retry in %ss",
+                        e.code,
+                        path,
+                        attempt,
+                        HTTP_RETRY_MAX,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    last_err = RuntimeError(f"API {path} HTTP {e.code}: {body}")
+                    continue
+                raise RuntimeError(f"API {path} HTTP {e.code}: {body}") from e
+            except urllib.error.URLError as e:
+                if attempt < HTTP_RETRY_MAX:
+                    delay = HTTP_RETRY_BACKOFF_SEC * attempt
+                    logger.warning(
+                        "Home Connect network error on %s (attempt %s/%s): %s",
+                        path,
+                        attempt,
+                        HTTP_RETRY_MAX,
+                        e,
+                    )
+                    time.sleep(delay)
+                    last_err = e
+                    continue
+                raise RuntimeError(f"API {path} network error: {e}") from e
+        if last_err:
+            raise last_err
+        raise RuntimeError(f"API {path} failed after retries")
 
     def _list_appliances(self, token: str, force: bool = False) -> List[Dict[str, Any]]:
         """Return appliances; cache discovery for DISCOVERY_TTL_SECONDS (default 6h)."""
@@ -1445,6 +1509,9 @@ class HomeConnectPlugin(PluginBase):
                 )
             )
             meta["state_file"] = _get_state_path()[:120]
+            meta["max_stale_cache_seconds"] = str(
+                int(self.config.get("max_stale_cache_seconds") or MAX_STALE_CACHE_SECONDS)
+            )
             meta["token_expires_at"] = (
                 time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(float(_TOKEN_CACHE.get("expires_at") or 0)))
                 if _TOKEN_CACHE.get("expires_at")
@@ -1467,9 +1534,24 @@ class HomeConnectPlugin(PluginBase):
                 cached = _DATA_CACHE.get("data")
                 if not cached:
                     return None
+                # Refuse extremely old snapshots (beyond max sensible age)
+                if not self._cache_is_fresh_enough():
+                    age = self._cache_age_seconds()
+                    logger.info(
+                        "Home Connect: cache too old to serve (age %ss > max %ss)",
+                        int(age or 0),
+                        int(self.config.get("max_stale_cache_seconds") or MAX_STALE_CACHE_SECONDS),
+                    )
+                    return None
                 data = _with_cache_flags(cached, from_cache=True, stale=stale)
                 if error:
                     data["api_warning"] = error[:120]
+                age = self._cache_age_seconds()
+                if age is not None:
+                    data["cache_age_seconds"] = str(int(age))
+                data["max_stale_cache_seconds"] = str(
+                    int(self.config.get("max_stale_cache_seconds") or MAX_STALE_CACHE_SECONDS)
+                )
                 return PluginResult(available=True, data=data)
 
             # Rate-limit suspension: never hit the API; show last good values
@@ -1703,13 +1785,15 @@ class HomeConnectPlugin(PluginBase):
 
         except HomeConnectRateLimitError as e:
             logger.warning("Home Connect rate limit: %s", e)
-            cached = _DATA_CACHE.get("data")
-            if cached:
-                data = dict(cached)
+            if self._cache_is_fresh_enough() and _DATA_CACHE.get("data"):
+                data = dict(_DATA_CACHE["data"])
                 data["data_from_cache"] = "YES"
                 data["data_stale"] = "YES"
                 data["api_warning"] = str(e)[:120]
                 data["rate_limit_suspended"] = "YES"
+                data["max_stale_cache_seconds"] = str(
+                    int(self.config.get("max_stale_cache_seconds") or MAX_STALE_CACHE_SECONDS)
+                )
                 return PluginResult(available=True, data=data)
             block, r1, r2, r3 = abridge_note_block("Home", "rate limit", abridge_status(str(e), 15))
             return PluginResult(
@@ -1727,12 +1811,18 @@ class HomeConnectPlugin(PluginBase):
         except Exception as e:
             logger.exception("home_connect error")
             # Prefer last good appliance snapshot over hard failure
-            cached = _DATA_CACHE.get("data")
-            if cached and "Not authorized" not in str(e):
-                data = dict(cached)
+            if (
+                self._cache_is_fresh_enough()
+                and _DATA_CACHE.get("data")
+                and "Not authorized" not in str(e)
+            ):
+                data = dict(_DATA_CACHE["data"])
                 data["data_from_cache"] = "YES"
                 data["data_stale"] = "YES"
                 data["api_warning"] = str(e)[:120]
+                data["max_stale_cache_seconds"] = str(
+                    int(self.config.get("max_stale_cache_seconds") or MAX_STALE_CACHE_SECONDS)
+                )
                 return PluginResult(available=True, data=data)
             msg = str(e)
             block, r1, r2, r3 = abridge_note_block("Home", "auth needed" if "Not authorized" in msg else "error", abridge_status(msg, 15))
