@@ -229,16 +229,72 @@ def extract_remaining_minutes(
     return None
 
 
+def extract_remaining_seconds(
+    items: Optional[list] = None,
+    status_text: str = "",
+) -> Optional[int]:
+    """Remaining program time in whole seconds (from API or minutes * 60)."""
+    priority_keys = (
+        "remainingprogramtime",
+        "remainingtime",
+        "finishin",
+    )
+    found: List[Tuple[int, int]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "")
+        key_l = key.lower().replace(".", "").replace("_", "")
+        if "elapsed" in key.lower():
+            continue
+        if not any(x in key.lower() for x in ("remaining", "finishin")):
+            continue
+        val = item.get("value")
+        disp = str(item.get("displayvalue") or item.get("displayValue") or "")
+        secs: Optional[int] = None
+        try:
+            n = float(val)
+            if "minute" in key.lower() and "second" not in key.lower():
+                secs = int(n * 60 + 0.999)
+            else:
+                # RemainingProgramTime is seconds
+                secs = int(n + 0.999)
+        except (TypeError, ValueError):
+            mins = _value_to_minutes(key, val, disp)
+            if mins is not None:
+                secs = mins * 60
+        if secs is None:
+            continue
+        pri = 0
+        for i, pk in enumerate(priority_keys):
+            if pk in key_l:
+                pri = 10 - i
+                break
+        if "remaining" in key.lower():
+            pri = max(pri, 5)
+        found.append((pri, max(0, secs)))
+    if found:
+        found.sort(key=lambda x: -x[0])
+        return found[0][1]
+    mins = extract_remaining_minutes(items, status_text)
+    if mins is not None:
+        return mins * 60
+    return None
+
+
 def format_appliance_summary_line(
     code: str,
     is_on: bool,
     remaining_min: Optional[int],
 ) -> str:
-    """e.g. {66}DWASH - 35min  or  {63}MWOVN - OFF  (Note-friendly)."""
+    """e.g. {66}DWASH - 35mins  or  {63}MWOVN - OFF  (Note-friendly).
+
+    1 minute → 'min'; more than 1 minute → 'mins'.
+    """
     flap = GREEN if is_on else RED
     if is_on and remaining_min is not None and remaining_min >= 0:
-        # Round up already applied in extract
-        body = f"{code} - {remaining_min}min"
+        unit = "min" if remaining_min == 1 else "mins"
+        body = f"{code} - {remaining_min}{unit}"
     elif is_on:
         body = f"{code} - ON"
     else:
@@ -864,12 +920,15 @@ class HomeConnectPlugin(PluginBase):
                     x in low_st for x in ("off", "inactive", "ready", "idle", "finished", "done")
                 )
 
-                remaining = extract_remaining_minutes(
-                    time_items, f"{primary} {detail} {short_status} {short_detail}"
-                )
-                # Always expose minutes when API has them, even if we classify off
+                blob = f"{primary} {detail} {short_status} {short_detail}"
+                remaining = extract_remaining_minutes(time_items, blob)
                 if remaining is None:
-                    remaining = extract_remaining_minutes(status_items, f"{primary} {detail}")
+                    remaining = extract_remaining_minutes(status_items, blob)
+                remaining_secs = extract_remaining_seconds(time_items, blob)
+                if remaining_secs is None:
+                    remaining_secs = extract_remaining_seconds(status_items, blob)
+                if remaining_secs is None and remaining is not None:
+                    remaining_secs = remaining * 60
 
                 summary_line = format_appliance_summary_line(code, is_on, remaining)
                 focus_block, fr1, fr2, fr3 = format_focus_note(
@@ -890,6 +949,7 @@ class HomeConnectPlugin(PluginBase):
                         "connected": "YES" if connected else "NO",
                         "is_on": "YES" if is_on else "NO",
                         "remaining_minutes": str(remaining) if remaining is not None else "",
+                        "remaining_seconds": str(remaining_secs) if remaining_secs is not None else "",
                         "status": short_status[:15],
                         "status_full": primary[:80],
                         "detail": short_detail[:15],
@@ -924,6 +984,7 @@ class HomeConnectPlugin(PluginBase):
                     "detail": p0["detail"],
                     "is_on": p0.get("is_on", ""),
                     "remaining_minutes": p0.get("remaining_minutes", ""),
+                    "remaining_seconds": p0.get("remaining_seconds", ""),
                     "summary_line": p0.get("summary_line", ""),
                     "board_summary": board_summary[:200],
                     "status_indicator": p0.get("status_indicator", ""),
@@ -989,6 +1050,7 @@ class HomeConnectPlugin(PluginBase):
                 data[f"appliance_{i+1}_detail"] = a["detail"]
                 data[f"appliance_{i+1}_is_on"] = a.get("is_on", "")
                 data[f"appliance_{i+1}_remaining_minutes"] = a.get("remaining_minutes", "")
+                data[f"appliance_{i+1}_remaining_seconds"] = a.get("remaining_seconds", "")
                 data[f"appliance_{i+1}_summary_line"] = a.get("summary_line", "")
                 data[f"appliance_{i+1}_note_block"] = a["note_block"]
                 data[f"appliance_{i+1}_note_row1"] = a["note_row1"]
@@ -1002,7 +1064,7 @@ class HomeConnectPlugin(PluginBase):
                 data[f"appliance_{i+1}_status_indicator_pair"] = a.get("status_indicator_pair", "")
             else:
                 for suf in (
-                    "name", "code", "status", "detail", "is_on", "remaining_minutes",
+                    "name", "code", "status", "detail", "is_on", "remaining_minutes", "remaining_seconds",
                     "summary_line", "note_block", "note_row1", "note_row2", "note_row3",
                     "focus_note_block", "connected",
                     "status_indicator", "status_indicator_name",
@@ -1035,6 +1097,7 @@ class HomeConnectPlugin(PluginBase):
                     "connected": "YES",
                     "is_on": "YES" if is_on else "NO",
                     "remaining_minutes": str(mins) if mins is not None else "",
+                    "remaining_seconds": str(mins * 60) if mins is not None else "",
                     "status": st,
                     "status_full": st,
                     "detail": det,
@@ -1063,6 +1126,7 @@ class HomeConnectPlugin(PluginBase):
             "detail": rows[0]["detail"],
             "is_on": rows[0].get("is_on", ""),
             "remaining_minutes": rows[0].get("remaining_minutes", ""),
+            "remaining_seconds": rows[0].get("remaining_seconds", ""),
             "summary_line": rows[0].get("summary_line", ""),
             "board_summary": " | ".join(summaries)[:200],
             "status_indicator": rows[0].get("status_indicator", ""),

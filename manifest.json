@@ -1,7 +1,7 @@
 {
   "id": "home_connect",
   "name": "Home Connect",
-  "version": "2.3.1",
+  "version": "2.3.2",
   "description": "Home Connect Note: 5-char codes (WASHM/DWASH/\u2026), green/red flaps, remaining minutes, focus Note block. Authorization Code OAuth.",
   "author": "peterdgreenway",
   "icon": "home",
@@ -240,7 +240,13 @@
       "appliance_5_is_on",
       "appliance_5_remaining_minutes",
       "appliance_5_summary_line",
-      "appliance_5_focus_note_block"
+      "appliance_5_focus_note_block",
+      "remaining_seconds",
+      "appliance_1_remaining_seconds",
+      "appliance_2_remaining_seconds",
+      "appliance_3_remaining_seconds",
+      "appliance_4_remaining_seconds",
+      "appliance_5_remaining_seconds"
     ],
     "arrays": {
       "appliances": {
@@ -267,7 +273,8 @@
           "is_on",
           "remaining_minutes",
           "summary_line",
-          "focus_note_block"
+          "focus_note_block",
+          "remaining_seconds"
         ]
       }
     }
