@@ -41,7 +41,7 @@ _RATE_LIMIT: Dict[str, Any] = {
 }
 _TOKEN_CACHE: Dict[str, Any] = {
     "access_token": "",
-    "expires_at": 0.0,  # unix time
+    "expires_at": 0.0,  # unix time — refresh when now >= expires_at (already skewed)
 }
 _DATA_CACHE: Dict[str, Any] = {
     "fetched_at": 0.0,
@@ -59,7 +59,183 @@ _API_BUDGET: Dict[str, Any] = {
 MIN_POLL_SECONDS = 300  # max full status poll once per 5 minutes
 DISCOVERY_TTL_SECONDS = 6 * 3600  # re-list appliances at most every 6 hours
 DAILY_API_BUDGET = 900  # hard stop before Home Connect's ~1000/day
-TOKEN_REFRESH_SKEW = 120  # refresh access token 2 min before expiry
+TOKEN_REFRESH_SKEW = 120  # 2-minute safety margin before access_token expiry
+_STATE_LOADED = False
+
+
+def _state_file_path() -> str:
+    """Persistent state path (survives plugin/container restart when volume is shared)."""
+    for key in (
+        "HOME_CONNECT_STATE_PATH",
+        "FIESTABOARD_HOME_CONNECT_STATE",
+    ):
+        p = (os.environ.get(key) or "").strip()
+        if p:
+            return p
+    base = (
+        (os.environ.get("FIESTABOARD_APP_DATA") or "").strip()
+        or (os.environ.get("APP_DATA") or "").strip()
+        or "/app_data"
+    )
+    # Fallbacks if /app_data is not writable
+    candidates = [
+        os.path.join(base, "home_connect_state.json"),
+        "/data/home_connect_state.json",
+        os.path.join(os.path.expanduser("~"), ".fiestaboard", "home_connect_state.json"),
+        "/tmp/home_connect_state.json",
+    ]
+    return candidates[0]
+
+
+def _find_writable_state_path() -> str:
+    primary = _state_file_path()
+    paths = [primary]
+    for alt in (
+        "/app_data/home_connect_state.json",
+        "/data/home_connect_state.json",
+        os.path.join(os.path.expanduser("~"), ".fiestaboard", "home_connect_state.json"),
+        "/tmp/home_connect_state.json",
+    ):
+        if alt not in paths:
+            paths.append(alt)
+    for p in paths:
+        try:
+            d = os.path.dirname(p) or "."
+            os.makedirs(d, exist_ok=True)
+            test = p + ".write_test"
+            with open(test, "w", encoding="utf-8") as f:
+                f.write("ok")
+            os.remove(test)
+            return p
+        except OSError:
+            continue
+    return "/tmp/home_connect_state.json"
+
+
+_STATE_PATH = ""  # resolved lazily
+
+
+def _get_state_path() -> str:
+    global _STATE_PATH
+    if not _STATE_PATH:
+        _STATE_PATH = _find_writable_state_path()
+        logger.info("Home Connect state file: %s", _STATE_PATH)
+    return _STATE_PATH
+
+
+def _load_persistent_state() -> None:
+    """Load budget, suspension, token cache, discovery, and last data from disk."""
+    global _STATE_LOADED
+    if _STATE_LOADED:
+        return
+    _STATE_LOADED = True
+    path = _get_state_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        logger.debug("Home Connect state file not found (first run): %s", path)
+        return
+    except Exception as e:
+        logger.warning("Home Connect state load failed: %s", e)
+        return
+
+    bud = state.get("api_budget") or {}
+    if isinstance(bud, dict):
+        _API_BUDGET["day_key"] = str(bud.get("day_key") or "")
+        try:
+            _API_BUDGET["count"] = int(bud.get("count") or 0)
+        except (TypeError, ValueError):
+            _API_BUDGET["count"] = 0
+
+    rl = state.get("rate_limit") or {}
+    if isinstance(rl, dict):
+        try:
+            _RATE_LIMIT["suspended_until"] = float(rl.get("suspended_until") or 0)
+        except (TypeError, ValueError):
+            _RATE_LIMIT["suspended_until"] = 0.0
+        _RATE_LIMIT["last_429_message"] = str(rl.get("last_429_message") or "")[:200]
+
+    tc = state.get("token_cache") or {}
+    if isinstance(tc, dict):
+        # access token stored encrypted when possible
+        tok = str(tc.get("access_token") or "")
+        if tok.startswith(("enc:", "obf:")):
+            try:
+                tok = decrypt_secret(tok)
+            except Exception:
+                tok = ""
+        _TOKEN_CACHE["access_token"] = tok
+        try:
+            _TOKEN_CACHE["expires_at"] = float(tc.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            _TOKEN_CACHE["expires_at"] = 0.0
+
+    disc = state.get("discovery_cache") or {}
+    if isinstance(disc, dict) and disc.get("appliances") is not None:
+        _DISCOVERY_CACHE["appliances"] = disc.get("appliances")
+        try:
+            _DISCOVERY_CACHE["fetched_at"] = float(disc.get("fetched_at") or 0)
+        except (TypeError, ValueError):
+            _DISCOVERY_CACHE["fetched_at"] = 0.0
+
+    data_c = state.get("data_cache") or {}
+    if isinstance(data_c, dict) and data_c.get("data") is not None:
+        _DATA_CACHE["data"] = data_c.get("data")
+        try:
+            _DATA_CACHE["fetched_at"] = float(data_c.get("fetched_at") or 0)
+        except (TypeError, ValueError):
+            _DATA_CACHE["fetched_at"] = 0.0
+
+    logger.info(
+        "Home Connect state loaded: budget %s/%s day=%s suspended_until=%s",
+        _API_BUDGET.get("count"),
+        DAILY_API_BUDGET,
+        _API_BUDGET.get("day_key"),
+        _RATE_LIMIT.get("suspended_until"),
+    )
+
+
+def _save_persistent_state() -> None:
+    """Persist budget, suspension, token expiry, discovery, last appliance snapshot."""
+    path = _get_state_path()
+    access = _TOKEN_CACHE.get("access_token") or ""
+    # Prefer encrypted token at rest
+    access_store = encrypt_secret(access) if access and not str(access).startswith(("enc:", "obf:")) else access
+    state = {
+        "version": 1,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "api_budget": {
+            "day_key": _API_BUDGET.get("day_key") or "",
+            "count": int(_API_BUDGET.get("count") or 0),
+        },
+        "rate_limit": {
+            "suspended_until": float(_RATE_LIMIT.get("suspended_until") or 0),
+            "last_429_message": str(_RATE_LIMIT.get("last_429_message") or "")[:200],
+        },
+        "token_cache": {
+            "access_token": access_store,
+            "expires_at": float(_TOKEN_CACHE.get("expires_at") or 0),
+        },
+        "discovery_cache": {
+            "fetched_at": float(_DISCOVERY_CACHE.get("fetched_at") or 0),
+            "appliances": _DISCOVERY_CACHE.get("appliances"),
+        },
+        "data_cache": {
+            "fetched_at": float(_DATA_CACHE.get("fetched_at") or 0),
+            "data": _DATA_CACHE.get("data"),
+        },
+    }
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=0)
+        os.replace(tmp, path)
+        logger.debug("Home Connect state saved: %s", path)
+    except Exception as e:
+        logger.warning("Home Connect state save failed (%s): %s", path, e)
+
+
 
 
 class HomeConnectRateLimitError(Exception):
@@ -969,6 +1145,7 @@ class HomeConnectPlugin(PluginBase):
             wait,
             time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(_RATE_LIMIT["suspended_until"])),
         )
+        _save_persistent_state()
 
     def _budget_day_key(self) -> str:
         return time.strftime("%Y-%m-%d", time.gmtime())
@@ -992,6 +1169,7 @@ class HomeConnectPlugin(PluginBase):
             DAILY_API_BUDGET,
             key,
         )
+        _save_persistent_state()
 
     def _api_get(self, path: str, token: str) -> Dict[str, Any]:
         if self._rate_limit_active():
@@ -1052,6 +1230,7 @@ class HomeConnectPlugin(PluginBase):
         apps = list((data.get("data") or {}).get("homeappliances") or [])
         _DISCOVERY_CACHE["appliances"] = apps
         _DISCOVERY_CACHE["fetched_at"] = time.time()
+        _save_persistent_state()
         return list(apps)
 
     def _appliance_status(self, token: str, ha_id: str) -> List[Dict[str, Any]]:
@@ -1223,6 +1402,7 @@ class HomeConnectPlugin(PluginBase):
     def fetch_data(self) -> PluginResult:
         try:
             # Decrypt secrets before manual refresh (run_refresh_now) or automated poll
+            _load_persistent_state()
             self._creds = self._prepare_credentials()
 
             force = bool(self.config.get("run_refresh_now", False))
@@ -1263,6 +1443,12 @@ class HomeConnectPlugin(PluginBase):
                     remaining=self._budget_remaining(),
                     suspended=self._rate_limit_active(),
                 )
+            )
+            meta["state_file"] = _get_state_path()[:120]
+            meta["token_expires_at"] = (
+                time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(float(_TOKEN_CACHE.get("expires_at") or 0)))
+                if _TOKEN_CACHE.get("expires_at")
+                else ""
             )
 
             def _with_cache_flags(data: Dict[str, Any], *, from_cache: bool, stale: bool = False) -> Dict[str, Any]:
@@ -1512,6 +1698,7 @@ class HomeConnectPlugin(PluginBase):
             data = _with_cache_flags(data, from_cache=False, stale=False)
             _DATA_CACHE["data"] = dict(data)
             _DATA_CACHE["fetched_at"] = time.time()
+            _save_persistent_state()
             return PluginResult(available=True, data=data)
 
         except HomeConnectRateLimitError as e:

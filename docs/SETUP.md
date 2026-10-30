@@ -97,3 +97,20 @@ Home Connect offers `GET /api/homeappliances/events` (SSE) for push updates. Fie
 | **Programme calls** | Only if OperationState is active **and** remaining time not already on status |
 | **Daily budget** | Hard stop at **900** counted API requests/UTC day (under 1000 limit) |
 | **Per idle appliance** | **1** call (`/status`) per poll cycle |
+
+
+## Persistent state (v2.7)
+
+Budget, rate-limit suspension, access-token cache (with **2-minute** refresh margin), discovery cache, and last appliance snapshot are stored in:
+
+```text
+$FIESTABOARD_APP_DATA/home_connect_state.json
+```
+
+Override with:
+
+```bash
+export HOME_CONNECT_STATE_PATH=/app_data/home_connect_state.json
+```
+
+Mount this file/dir in Docker so container restarts keep the daily counter.

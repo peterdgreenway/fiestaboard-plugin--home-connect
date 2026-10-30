@@ -1,7 +1,7 @@
 {
   "id": "home_connect",
   "name": "Home Connect",
-  "version": "2.6.1",
+  "version": "2.7.0",
   "description": "Home Connect: 5-min poll, discovery cache 6h, programme calls only when needed, hard 900 API calls/day budget, last-good data on 429.",
   "author": "peterdgreenway",
   "icon": "home",
@@ -301,7 +301,9 @@
       "api_usage_percent",
       "api_usage_status",
       "api_usage_indicator",
-      "api_usage_indicator_name"
+      "api_usage_indicator_name",
+      "state_file",
+      "token_expires_at"
     ],
     "arrays": {
       "appliances": {
