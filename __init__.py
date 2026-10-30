@@ -83,7 +83,38 @@ APPLIANCE_CODES = {
 
 
 def appliance_type_code(name: str, type_str: str = "") -> str:
-    """Map appliance name/type to a 5-character code (no manufacturer)."""
+    """Map appliance name/type to a 5-character code (no manufacturer).
+
+    Microwave → MWOVN (never MOVEN). Main oven → MOVEN.
+    """
+    # Name wins for microwave so it never becomes MOVEN
+    name_l = (name or "").lower()
+    if "microwave" in name_l or "microwave" in (type_str or "").lower():
+        return "MWOVN"
+
+    # Direct API type enum (Home Connect)
+    t = (type_str or "").strip().lower().replace(" ", "").replace("_", "")
+    enum_map = {
+        "washingmachine": "WASHM",
+        "washer": "WASHM",
+        "dryer": "DRYER",
+        "dishwasher": "DWASH",
+        "microwave": "MWOVN",
+        "microwaveoven": "MWOVN",
+        "oven": "MOVEN",
+        "cookprocessor": "COOKP",
+        "coffeemaker": "COFFE",
+        "coffeemachine": "COFFE",
+        "fridgefreezer": "FRIDG",
+        "refrigerator": "FRIDG",
+        "freezer": "FREEZ",
+        "hob": "INHOB",
+        "cooktop": "INHOB",
+        "hood": "HOODX",
+        "warmingdrawer": "WDRAW",
+    }
+    if t in enum_map:
+        return enum_map[t]
     raw = f"{name} {type_str}".lower()
     raw = re.sub(r"[^a-z0-9]+", " ", raw)
     for brand in (
@@ -106,51 +137,92 @@ def appliance_type_code(name: str, type_str: str = "") -> str:
     return (letters + "XXXXX")[:5]
 
 
-def extract_remaining_minutes(status_items: list, status_text: str = "") -> Optional[int]:
-    """Best-effort remaining time in minutes (round up)."""
-    # Prefer structured status keys
-    for item in status_items or []:
-        key = str(item.get("key") or "").lower()
+def _value_to_minutes(key: str, val: Any, disp: str = "") -> Optional[int]:
+    """Convert Home Connect option/status value to whole minutes (round up)."""
+    key_l = (key or "").lower()
+    disp = str(disp or "")
+
+    # Explicit display strings first (e.g. "1 h 5 min", "45 min")
+    m = re.search(r"(\d+)\s*h(?:ours?)?\s*(\d+)?\s*m?", disp, re.I)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2) or 0)
+    m = re.search(r"(\d+)\s*m(?:in(?:ute)?s?)?", disp, re.I)
+    if m and "remaining" in key_l or "finish" in key_l or "duration" in key_l or not key_l:
+        if m:
+            return int(m.group(1))
+
+    try:
+        n = float(val)
+    except (TypeError, ValueError):
+        m3 = re.search(r"(\d+)", disp)
+        return int(m3.group(1)) if m3 else None
+
+    # Home Connect RemainingProgramTime is almost always SECONDS
+    if "remaining" in key_l or "finishin" in key_l:
+        if "minute" in key_l and "second" not in key_l:
+            return max(0, int(n + 0.999))
+        # seconds → minutes, round up
+        return max(0, int((n + 59) // 60)) if n >= 0 else None
+
+    if "duration" in key_l or "elapsed" in key_l:
+        if "minute" in key_l:
+            return max(0, int(n + 0.999))
+        return max(0, int((n + 59) // 60))
+
+    # Unknown numeric: treat large as seconds, small as minutes
+    if n >= 120:
+        return max(0, int((n + 59) // 60))
+    return max(0, int(n + 0.999))
+
+
+def extract_remaining_minutes(
+    items: Optional[list] = None,
+    status_text: str = "",
+) -> Optional[int]:
+    """Harvest remaining program time from status/options keys (minutes, rounded up)."""
+    priority_keys = (
+        "remainingprogramtime",
+        "remainingtime",
+        "finishin",
+        "startinrelative",
+    )
+    found: List[Tuple[int, int]] = []  # (priority, minutes)
+
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "")
+        key_l = key.lower().replace(".", "").replace("_", "")
         val = item.get("value")
-        disp = str(item.get("displayvalue") or item.get("value") or "")
-        if any(
-            x in key
-            for x in (
-                "remaining",
-                "finishin",
-                "duration",
-                "elapsed",
-            )
+        disp = str(item.get("displayvalue") or item.get("displayValue") or "")
+        if not any(
+            x in key.lower()
+            for x in ("remaining", "finishin", "duration", "elapsed", "progress")
         ):
-            # Numeric seconds or minutes
-            try:
-                n = float(val)
-                # Heuristic: large numbers are seconds
-                if n > 180:  # > 3h as minutes is rare for cycle remaining display in seconds
-                    mins = int((n + 59) // 60) if n > 300 else int(n)
-                    # If key suggests seconds
-                    if "second" in key or n >= 60 and "minute" not in key:
-                        mins = int((n + 59) // 60)
-                    return max(0, mins)
-                return max(0, int((n + 0.999) // 1))
-            except (TypeError, ValueError):
-                pass
-            m = re.search(r"(\d+)\s*(h|hr|hour)", disp, re.I)
-            h = int(m.group(1)) if m else 0
-            m2 = re.search(r"(\d+)\s*(m|min)", disp, re.I)
-            mins = int(m2.group(1)) if m2 else 0
-            if h or mins:
-                return h * 60 + mins
-            m3 = re.search(r"(\d+)", disp)
-            if m3:
-                return max(0, int(m3.group(1)))
-    # Free text
+            continue
+        # Prefer remaining over duration/elapsed
+        mins = _value_to_minutes(key, val, disp)
+        if mins is None:
+            continue
+        if "elapsed" in key.lower():
+            continue  # elapsed is not remaining
+        pri = 0
+        for i, pk in enumerate(priority_keys):
+            if pk in key_l:
+                pri = 10 - i
+                break
+        if "remaining" in key.lower():
+            pri = max(pri, 5)
+        found.append((pri, mins))
+
+    if found:
+        found.sort(key=lambda x: -x[0])
+        return found[0][1]
+
     blob = status_text or ""
     m = re.search(r"(\d+)\s*h(?:our)?s?\s*(\d+)?\s*m?", blob, re.I)
     if m:
-        h = int(m.group(1))
-        mins = int(m.group(2) or 0)
-        return h * 60 + mins
+        return int(m.group(1)) * 60 + int(m.group(2) or 0)
     m = re.search(r"(\d+)\s*m(?:in)?", blob, re.I)
     if m:
         return int(m.group(1))
@@ -619,6 +691,41 @@ class HomeConnectPlugin(PluginBase):
             logger.warning("status %s: %s", ha_id, e)
             return []
 
+    def _appliance_time_items(self, token: str, ha_id: str) -> List[Dict[str, Any]]:
+        """Collect status + active program options (RemainingProgramTime lives here)."""
+        items: List[Dict[str, Any]] = []
+        items.extend(self._appliance_status(token, ha_id))
+        try:
+            data = self._api_get(f"/api/homeappliances/{ha_id}/programs/active", token)
+            prog = (data.get("data") or {}) if isinstance(data, dict) else {}
+            # options may be under data.options
+            opts = prog.get("options") or []
+            if isinstance(opts, list):
+                items.extend(opts)
+            # some payloads nest key/value at top level
+            if prog.get("key") and "remaining" in str(prog.get("key")).lower():
+                items.append(prog)
+        except Exception as e:
+            # No active program is common when appliance is off
+            logger.debug("active program %s: %s", ha_id, e)
+        try:
+            data = self._api_get(
+                f"/api/homeappliances/{ha_id}/programs/active/options", token
+            )
+            opts = (data.get("data") or {}).get("options") or data.get("data") or []
+            if isinstance(opts, list):
+                items.extend(opts)
+            elif isinstance(opts, dict):
+                # single option map
+                for k, v in opts.items():
+                    if isinstance(v, dict):
+                        items.append({"key": v.get("key") or k, **v})
+                    else:
+                        items.append({"key": k, "value": v})
+        except Exception as e:
+            logger.debug("active options %s: %s", ha_id, e)
+        return items
+
     def _pick_status_summary(self, items: List[Dict[str, Any]]) -> Tuple[str, str]:
         by_key = {str(i.get("key") or ""): i for i in items}
         primary = detail = ""
@@ -733,10 +840,12 @@ class HomeConnectPlugin(PluginBase):
                 if connected:
                     online += 1
                 status_items = self._appliance_status(token, ha_id) if ha_id else []
+                time_items = self._appliance_time_items(token, ha_id) if ha_id else list(status_items)
                 primary, detail = self._pick_status_summary(status_items)
                 if not connected:
                     primary = "offline"
                 type_raw = str(app.get("type") or "")
+                # Prefer Home Connect type enum for coding (Microwave, Oven, …)
                 code = appliance_type_code(name, type_raw)
                 short_name = abridge_status(name, 13)
                 short_status = abridge_status(primary, 15)
@@ -755,10 +864,12 @@ class HomeConnectPlugin(PluginBase):
                     x in low_st for x in ("off", "inactive", "ready", "idle", "finished", "done")
                 )
 
-                remaining = extract_remaining_minutes(status_items, f"{primary} {detail}")
-                if is_on and remaining is None:
-                    # try option keys via status list again with broader text
-                    remaining = extract_remaining_minutes(status_items, short_detail)
+                remaining = extract_remaining_minutes(
+                    time_items, f"{primary} {detail} {short_status} {short_detail}"
+                )
+                # Always expose minutes when API has them, even if we classify off
+                if remaining is None:
+                    remaining = extract_remaining_minutes(status_items, f"{primary} {detail}")
 
                 summary_line = format_appliance_summary_line(code, is_on, remaining)
                 focus_block, fr1, fr2, fr3 = format_focus_note(

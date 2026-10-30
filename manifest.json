@@ -1,7 +1,7 @@
 {
   "id": "home_connect",
   "name": "Home Connect",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "Home Connect Note: 5-char codes (WASHM/DWASH/\u2026), green/red flaps, remaining minutes, focus Note block. Authorization Code OAuth.",
   "author": "peterdgreenway",
   "icon": "home",
