@@ -46,9 +46,19 @@ _TOKEN_CACHE: Dict[str, Any] = {
 _DATA_CACHE: Dict[str, Any] = {
     "fetched_at": 0.0,
     "data": None,  # last successful PluginResult data dict
-    "fingerprint": "",  # optional change detection
+    "fingerprint": "",
 }
-MIN_POLL_SECONDS = 300  # max once per 5 minutes
+_DISCOVERY_CACHE: Dict[str, Any] = {
+    "fetched_at": 0.0,
+    "appliances": None,  # list of appliance dicts from API
+}
+_API_BUDGET: Dict[str, Any] = {
+    "day_key": "",  # YYYY-MM-DD UTC
+    "count": 0,
+}
+MIN_POLL_SECONDS = 300  # max full status poll once per 5 minutes
+DISCOVERY_TTL_SECONDS = 6 * 3600  # re-list appliances at most every 6 hours
+DAILY_API_BUDGET = 900  # hard stop before Home Connect's ~1000/day
 TOKEN_REFRESH_SKEW = 120  # refresh access token 2 min before expiry
 
 
@@ -565,6 +575,58 @@ def abridge_note_block(title: str, status: str, detail: str = "") -> Tuple[str, 
     return f"{r1}\n{_pad(st.upper() if st else '—')}\n{_pad(det.upper() if det else '')}", r1, _pad(st.upper() if st else "—"), _pad(det.upper() if det else "")
 
 
+
+def build_api_usage_dashboard(
+    calls: int,
+    limit: int,
+    remaining: int,
+    suspended: bool,
+    cache_age: str = "",
+    discovery_age: str = "",
+) -> Dict[str, str]:
+    """Note-friendly API usage dashboard fields."""
+    calls = max(0, int(calls))
+    limit = max(1, int(limit))
+    remaining = max(0, int(remaining))
+    pct = min(100, int(round(100.0 * calls / limit)))
+    # Colour: green under 70%, yellow 70–89%, red 90%+ or suspended
+    if suspended or pct >= 90:
+        flap, flap_name = RED, "red"
+    elif pct >= 70:
+        flap, flap_name = YELLOW, "yellow"
+    else:
+        flap, flap_name = GREEN, "green"
+
+    # Row1: flap + API + pct
+    r1_body = f" API {pct}%"
+    r1 = f"{flap}{r1_body}"
+    while _tile_len(r1) > 15 and len(r1_body) > 4:
+        r1_body = r1_body[:-1]
+        r1 = f"{flap}{r1_body}"
+
+    r2 = _pad(f"{calls}/{limit}")
+    if suspended:
+        r3 = _pad("SUSPENDED")
+        status = "SUSPENDED"
+    else:
+        r3 = _pad(f"{remaining} LEFT")
+        status = "OK" if pct < 90 else "HIGH"
+
+    block = f"{r1}\n{r2}\n{r3}"
+    return {
+        "api_usage_note_row1": r1,
+        "api_usage_note_row2": r2,
+        "api_usage_note_row3": r3,
+        "api_usage_note_block": block,
+        "api_usage_percent": str(pct),
+        "api_usage_status": status,
+        "api_usage_indicator": flap,
+        "api_usage_indicator_name": flap_name,
+        "api_calls_today": str(calls),
+        "api_budget_limit": str(limit),
+        "api_budget_remaining": str(remaining),
+    }
+
 class HomeConnectPlugin(PluginBase):
     """Home Connect via Authorization Code Grant Flow."""
 
@@ -741,9 +803,18 @@ class HomeConnectPlugin(PluginBase):
         )
         try:
             with urllib.request.urlopen(req, timeout=45) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                payload = json.loads(resp.read().decode("utf-8"))
+                # Token endpoint counts toward daily Home Connect budget
+                try:
+                    self._budget_consume(1)
+                except Exception:
+                    pass
+                return payload
         except urllib.error.HTTPError as e:
             err = e.read().decode("utf-8", errors="replace")[:400]
+            if e.code == 429:
+                self._suspend_for_429(3600, err)
+                raise HomeConnectRateLimitError(err, retry_after=3600) from e
             raise RuntimeError(f"Token request failed: {e.code} {err}") from e
 
     def _persist_tokens(self, payload: Dict[str, Any]) -> str:
@@ -899,10 +970,40 @@ class HomeConnectPlugin(PluginBase):
             time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(_RATE_LIMIT["suspended_until"])),
         )
 
+    def _budget_day_key(self) -> str:
+        return time.strftime("%Y-%m-%d", time.gmtime())
+
+    def _budget_remaining(self) -> int:
+        key = self._budget_day_key()
+        if _API_BUDGET.get("day_key") != key:
+            _API_BUDGET["day_key"] = key
+            _API_BUDGET["count"] = 0
+        return max(0, DAILY_API_BUDGET - int(_API_BUDGET.get("count") or 0))
+
+    def _budget_consume(self, n: int = 1) -> None:
+        key = self._budget_day_key()
+        if _API_BUDGET.get("day_key") != key:
+            _API_BUDGET["day_key"] = key
+            _API_BUDGET["count"] = 0
+        _API_BUDGET["count"] = int(_API_BUDGET.get("count") or 0) + n
+        logger.debug(
+            "Home Connect API budget: %s/%s used (UTC day %s)",
+            _API_BUDGET["count"],
+            DAILY_API_BUDGET,
+            key,
+        )
+
     def _api_get(self, path: str, token: str) -> Dict[str, Any]:
         if self._rate_limit_active():
             raise HomeConnectRateLimitError(
                 _RATE_LIMIT.get("last_429_message") or "rate limit suspension active",
+                retry_after=max(1, int(_RATE_LIMIT["suspended_until"] - time.time())),
+            )
+        if self._budget_remaining() <= 0:
+            # Suspend until next UTC midnight
+            self._suspend_for_429(3600, "local daily API budget exhausted (900/day)")
+            raise HomeConnectRateLimitError(
+                "local daily API budget exhausted",
                 retry_after=max(1, int(_RATE_LIMIT["suspended_until"] - time.time())),
             )
         host, _, _ = self._api_roots()
@@ -916,7 +1017,9 @@ class HomeConnectPlugin(PluginBase):
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                body = json.loads(resp.read().decode("utf-8"))
+                self._budget_consume(1)
+                return body
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")[:500]
             if e.code == 429:
@@ -930,9 +1033,26 @@ class HomeConnectPlugin(PluginBase):
                 raise HomeConnectRateLimitError(body or "HTTP 429", retry_after=retry_after) from e
             raise RuntimeError(f"API {path} HTTP {e.code}: {body}") from e
 
-    def _list_appliances(self, token: str) -> List[Dict[str, Any]]:
+    def _list_appliances(self, token: str, force: bool = False) -> List[Dict[str, Any]]:
+        """Return appliances; cache discovery for DISCOVERY_TTL_SECONDS (default 6h)."""
+        age = time.time() - float(_DISCOVERY_CACHE.get("fetched_at") or 0)
+        cached = _DISCOVERY_CACHE.get("appliances")
+        if (
+            not force
+            and cached is not None
+            and age < DISCOVERY_TTL_SECONDS
+        ):
+            logger.debug(
+                "Home Connect: discovery cache hit (%s appliances, age %ss)",
+                len(cached),
+                int(age),
+            )
+            return list(cached)
         data = self._api_get("/api/homeappliances", token)
-        return list((data.get("data") or {}).get("homeappliances") or [])
+        apps = list((data.get("data") or {}).get("homeappliances") or [])
+        _DISCOVERY_CACHE["appliances"] = apps
+        _DISCOVERY_CACHE["fetched_at"] = time.time()
+        return list(apps)
 
     def _appliance_status(self, token: str, ha_id: str) -> List[Dict[str, Any]]:
         try:
@@ -946,11 +1066,60 @@ class HomeConnectPlugin(PluginBase):
         for it in status_items or []:
             key = str(it.get("key") or "")
             val = str(it.get("displayvalue") or it.get("value") or "").lower()
-            if "OperationState" in key:
-                if any(x in val for x in ("run", "active", "delayed", "pause", "action")):
+            val = val.replace(" ", "").replace("_", "").replace(".", "")
+            if "OperationState" in key or "operationstate" in key.lower():
+                # Exact-ish state tokens (avoid "action" matching inside "Inactive")
+                active_tokens = (
+                    "run",
+                    "running",
+                    "active",
+                    "delayedstart",
+                    "pause",
+                    "paused",
+                    "actionrequired",
+                    "hold",
+                )
+                inactive_tokens = (
+                    "ready",
+                    "inactive",
+                    "idle",
+                    "finished",
+                    "finalize",
+                    "off",
+                )
+                if any(t == val or val.endswith(t) or t in val for t in inactive_tokens):
+                    if not any(t == val or val.endswith("." + t) for t in active_tokens):
+                        # e.g. BSH.Common.EnumType.OperationState.Inactive
+                        if "inactive" in val or "ready" in val or "finished" in val:
+                            return False
+                if any(
+                    t in val
+                    for t in (
+                        "operationstate.run",
+                        "operationstate.running",
+                        "operationstate.active",
+                        "operationstate.delayedstart",
+                        "operationstate.pause",
+                        "operationstate.actionrequired",
+                        ".run",
+                        ".running",
+                        ".active",
+                        ".delayedstart",
+                        ".pause",
+                        ".actionrequired",
+                    )
+                ):
                     return True
-                if any(x in val for x in ("ready", "inactive", "off", "finished")):
-                    return False
+                if val in active_tokens or any(val.endswith(t) for t in active_tokens):
+                    return True
+                return False
+        return False
+
+    def _status_already_has_remaining(self, status_items: List[Dict[str, Any]]) -> bool:
+        for it in status_items or []:
+            key = str(it.get("key") or "").lower()
+            if "remaining" in key:
+                return True
         return False
 
     def _appliance_time_items(
@@ -959,9 +1128,11 @@ class HomeConnectPlugin(PluginBase):
         ha_id: str,
         status_items: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
-        """Status + active program options only when the appliance looks active.
+        """Attach active-program options only when needed for remaining time.
 
-        Avoids 2 extra API calls per idle device (major rate-limit saver).
+        - Idle → status only (0 extra calls)
+        - Active but remaining already on status → no program calls
+        - Active and need remaining → 1× /programs/active (options embedded when present)
         """
         items: List[Dict[str, Any]] = []
         if status_items is None:
@@ -969,23 +1140,18 @@ class HomeConnectPlugin(PluginBase):
         items.extend(status_items)
         if not self._operation_looks_active(status_items):
             return items
+        if self._status_already_has_remaining(status_items):
+            return items
+        if self._budget_remaining() < 1:
+            return items
         try:
             data = self._api_get(f"/api/homeappliances/{ha_id}/programs/active", token)
             prog = (data.get("data") or {}) if isinstance(data, dict) else {}
             opts = prog.get("options") or []
             if isinstance(opts, list):
                 items.extend(opts)
-            # Options are often already embedded — only call /options if none present
-            if not opts:
-                try:
-                    data2 = self._api_get(
-                        f"/api/homeappliances/{ha_id}/programs/active/options", token
-                    )
-                    opts2 = (data2.get("data") or {}).get("options") or data2.get("data") or []
-                    if isinstance(opts2, list):
-                        items.extend(opts2)
-                except Exception as e:
-                    logger.debug("active options %s: %s", ha_id, e)
+            # Do NOT call /programs/active/options separately — avoids double call;
+            # remaining time is almost always in active.options when present.
         except Exception as e:
             logger.debug("active program %s: %s", ha_id, e)
         return items
@@ -1079,12 +1245,25 @@ class HomeConnectPlugin(PluginBase):
                 "suggested_refresh_seconds": str(refresh_seconds),
                 "min_poll_seconds": str(MIN_POLL_SECONDS),
                 "rate_limit_suspended": "YES" if self._rate_limit_active() else "NO",
+                "discovery_cache_age": str(
+                    int(time.time() - float(_DISCOVERY_CACHE.get("fetched_at") or 0))
+                    if _DISCOVERY_CACHE.get("fetched_at")
+                    else ""
+                ),
                 "cache_age_seconds": str(
                     int(time.time() - float(_DATA_CACHE.get("fetched_at") or 0))
                     if _DATA_CACHE.get("fetched_at")
                     else ""
                 ),
             }
+            meta.update(
+                build_api_usage_dashboard(
+                    calls=int(_API_BUDGET.get("count") or 0),
+                    limit=DAILY_API_BUDGET,
+                    remaining=self._budget_remaining(),
+                    suspended=self._rate_limit_active(),
+                )
+            )
 
             def _with_cache_flags(data: Dict[str, Any], *, from_cache: bool, stale: bool = False) -> Dict[str, Any]:
                 data = dict(data)
@@ -1177,7 +1356,7 @@ class HomeConnectPlugin(PluginBase):
                 return PluginResult(available=True, data=data)
 
             token = self._get_token()
-            appliances = self._list_appliances(token)
+            appliances = self._list_appliances(token, force=force)
             filt = (self.config.get("appliance_filter") or "").strip().lower()
             if filt:
                 parts = [p.strip() for p in filt.split(",") if p.strip()]

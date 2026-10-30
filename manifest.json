@@ -1,8 +1,8 @@
 {
   "id": "home_connect",
   "name": "Home Connect",
-  "version": "2.5.0",
-  "description": "Home Connect (washer/dishwasher). Max poll 5 min, response cache, token refresh only when needed, HTTP 429 backoff, last-good data on errors.",
+  "version": "2.6.1",
+  "description": "Home Connect: 5-min poll, discovery cache 6h, programme calls only when needed, hard 900 API calls/day budget, last-good data on 429.",
   "author": "peterdgreenway",
   "icon": "home",
   "category": "data",
@@ -289,7 +289,19 @@
       "rate_limit_suspended",
       "min_poll_seconds",
       "cache_age_seconds",
-      "cache_fetched_at"
+      "cache_fetched_at",
+      "api_calls_today",
+      "api_budget_limit",
+      "api_budget_remaining",
+      "discovery_cache_age",
+      "api_usage_note_row1",
+      "api_usage_note_row2",
+      "api_usage_note_row3",
+      "api_usage_note_block",
+      "api_usage_percent",
+      "api_usage_status",
+      "api_usage_indicator",
+      "api_usage_indicator_name"
     ],
     "arrays": {
       "appliances": {

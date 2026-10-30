@@ -87,3 +87,13 @@ With 2 devices every few minutes that exceeds the daily limit.
 ### Server-Sent Events (SSE)
 
 Home Connect offers `GET /api/homeappliances/events` (SSE) for push updates. FiestaBoard plugins are **pull-based** (`fetch_data` on a timer), so a long-lived SSE client is not used in this build. Polling at ≤1/5 min with caching is the supported approach; SSE would need a side process outside the plugin poll model.
+
+
+## API budget & discovery cache (v2.6)
+
+| Mechanism | Detail |
+|-----------|--------|
+| **Discovery cache** | `/api/homeappliances` at most every **6 hours** (or on Run refresh now) |
+| **Programme calls** | Only if OperationState is active **and** remaining time not already on status |
+| **Daily budget** | Hard stop at **900** counted API requests/UTC day (under 1000 limit) |
+| **Per idle appliance** | **1** call (`/status`) per poll cycle |
