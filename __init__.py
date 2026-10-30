@@ -51,6 +51,170 @@ BLUE = "{67}"
 VIOLET = "{68}"
 WHITE = "{69}"
 
+
+# 5-char type codes (no manufacturer name)
+APPLIANCE_CODES = {
+    "washingmachine": "WASHM",
+    "dishwasher": "DWASH",
+    "tumbledryer": "DRYER",
+    "microwaveoven": "MWOVN",
+    "coffeemaker": "COFFE",
+    "refrigerator": "FRIDG",
+    "warmingdrawer": "WDRAW",
+    "cooktop": "INHOB",
+    "inductionhob": "INHOB",
+    "induction": "INHOB",
+    "microwave": "MWOVN",
+    "washer": "WASHM",
+    "washing": "WASHM",
+    "dryer": "DRYER",
+    "dish": "DWASH",
+    "oven": "MOVEN",
+    "stove": "MOVEN",
+    "hob": "INHOB",
+    "coffee": "COFFE",
+    "espresso": "COFFE",
+    "fridge": "FRIDG",
+    "freezer": "FREEZ",
+    "hood": "HOODX",
+    "ventilator": "HOODX",
+    "drawer": "WDRAW",
+}
+
+
+def appliance_type_code(name: str, type_str: str = "") -> str:
+    """Map appliance name/type to a 5-character code (no manufacturer)."""
+    raw = f"{name} {type_str}".lower()
+    raw = re.sub(r"[^a-z0-9]+", " ", raw)
+    for brand in (
+        "bosch", "siemens", "neff", "gaggenau", "balay", "constructa",
+        "profilo", "thermador", "home", "connect",
+    ):
+        raw = re.sub(rf"\b{brand}\b", " ", raw)
+    compact = re.sub(r"\s+", "", raw)
+    # Longest keys first so microwaveoven wins over oven, dishwasher over washer
+    keys = sorted(APPLIANCE_CODES.keys(), key=len, reverse=True)
+    for key in keys:
+        if key in compact:
+            return APPLIANCE_CODES[key]
+    # Token match
+    tokens = set(raw.split())
+    for key in keys:
+        if key in tokens:
+            return APPLIANCE_CODES[key]
+    letters = re.sub(r"[^A-Z]", "", (name or type_str or "APPL").upper())
+    return (letters + "XXXXX")[:5]
+
+
+def extract_remaining_minutes(status_items: list, status_text: str = "") -> Optional[int]:
+    """Best-effort remaining time in minutes (round up)."""
+    # Prefer structured status keys
+    for item in status_items or []:
+        key = str(item.get("key") or "").lower()
+        val = item.get("value")
+        disp = str(item.get("displayvalue") or item.get("value") or "")
+        if any(
+            x in key
+            for x in (
+                "remaining",
+                "finishin",
+                "duration",
+                "elapsed",
+            )
+        ):
+            # Numeric seconds or minutes
+            try:
+                n = float(val)
+                # Heuristic: large numbers are seconds
+                if n > 180:  # > 3h as minutes is rare for cycle remaining display in seconds
+                    mins = int((n + 59) // 60) if n > 300 else int(n)
+                    # If key suggests seconds
+                    if "second" in key or n >= 60 and "minute" not in key:
+                        mins = int((n + 59) // 60)
+                    return max(0, mins)
+                return max(0, int((n + 0.999) // 1))
+            except (TypeError, ValueError):
+                pass
+            m = re.search(r"(\d+)\s*(h|hr|hour)", disp, re.I)
+            h = int(m.group(1)) if m else 0
+            m2 = re.search(r"(\d+)\s*(m|min)", disp, re.I)
+            mins = int(m2.group(1)) if m2 else 0
+            if h or mins:
+                return h * 60 + mins
+            m3 = re.search(r"(\d+)", disp)
+            if m3:
+                return max(0, int(m3.group(1)))
+    # Free text
+    blob = status_text or ""
+    m = re.search(r"(\d+)\s*h(?:our)?s?\s*(\d+)?\s*m?", blob, re.I)
+    if m:
+        h = int(m.group(1))
+        mins = int(m.group(2) or 0)
+        return h * 60 + mins
+    m = re.search(r"(\d+)\s*m(?:in)?", blob, re.I)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def format_appliance_summary_line(
+    code: str,
+    is_on: bool,
+    remaining_min: Optional[int],
+) -> str:
+    """e.g. {66}DWASH - 35min  or  {63}MWOVN - OFF  (Note-friendly)."""
+    flap = GREEN if is_on else RED
+    if is_on and remaining_min is not None and remaining_min >= 0:
+        # Round up already applied in extract
+        body = f"{code} - {remaining_min}min"
+    elif is_on:
+        body = f"{code} - ON"
+    else:
+        body = f"{code} - OFF"
+    # 1 colour tile + text; keep total tiles <= 22 for variable use, Note uses 15
+    line = f"{flap}{body}"
+    # Prefer fitting 15 tiles for Note strip
+    while _tile_len(line) > 15 and len(body) > 5:
+        body = body[:-1]
+        line = f"{flap}{body}"
+    return line
+
+
+def format_focus_note(
+    code: str,
+    is_on: bool,
+    status: str,
+    detail: str,
+) -> Tuple[str, str, str, str]:
+    """Single-appliance Note: L1 flap+type, L2+L3 abridged status (30 chars total)."""
+    flap = GREEN if is_on else RED
+    r1 = f"{flap}{code}"
+    # pad row1 to visual width without exceeding 15 tiles
+    while _tile_len(r1) < 15:
+        r1 = r1 + " "
+    r1 = r1 if _tile_len(r1) <= 15 else f"{flap}{code}"[:20]
+    while _tile_len(r1) > 15:
+        r1 = r1[:-1]
+
+    combined = abridge_status(f"{status} {detail}".strip(), 30)
+    if len(combined) <= 15:
+        r2 = _pad(combined.upper())
+        r3 = _pad("")
+    else:
+        # split across two lines at space if possible
+        cut = combined[:15]
+        if " " in cut:
+            left = cut.rsplit(" ", 1)[0]
+            rest = combined[len(left):].strip()
+        else:
+            left = combined[:15]
+            rest = combined[15:30]
+        r2 = _pad(left.upper())
+        r3 = _pad(abridge_status(rest, 15).upper())
+    block = f"{r1}\n{r2}\n{r3}"
+    return block, r1, r2, r3
+
+
 _ABBREV = [
     (r"\boperation state\b", "state"),
     (r"\boperating\b", "run"),
@@ -572,49 +736,85 @@ class HomeConnectPlugin(PluginBase):
                 primary, detail = self._pick_status_summary(status_items)
                 if not connected:
                     primary = "offline"
+                type_raw = str(app.get("type") or "")
+                code = appliance_type_code(name, type_raw)
                 short_name = abridge_status(name, 13)
                 short_status = abridge_status(primary, 15)
                 short_detail = abridge_status(detail, 15)
                 ind = status_indicator(short_status + " " + primary, connected)
-                block, r1, r2, r3 = abridge_note_block(short_name, short_status, short_detail)
-                # Prefix Note row1 with status indicator colour pair (replace default pair)
-                body = re.sub(r"^(\{\d{2}\}){1,2}", "", r1)
-                r1 = f"{ind['indicator_pair']}{body}"
-                while _tile_len(r1) > NOTE_WIDTH and body:
-                    body = body[:-1]
-                    r1 = f"{ind['indicator_pair']}{body}"
-                block = f"{r1}\n{r2}\n{r3}"
+                is_on = ind["indicator_label"] == "RUNNING" or (
+                    connected
+                    and ind["indicator"] == GREEN
+                )
+                # Treat RUNNING green as on; also active operation keywords
+                low_st = (primary + " " + short_status).lower()
+                is_on = connected and any(
+                    x in low_st
+                    for x in ("run", "active", "prog", "operating", "wash", "dry", "cook", "heat", "on")
+                ) and not any(
+                    x in low_st for x in ("off", "inactive", "ready", "idle", "finished", "done")
+                )
+
+                remaining = extract_remaining_minutes(status_items, f"{primary} {detail}")
+                if is_on and remaining is None:
+                    # try option keys via status list again with broader text
+                    remaining = extract_remaining_minutes(status_items, short_detail)
+
+                summary_line = format_appliance_summary_line(code, is_on, remaining)
+                focus_block, fr1, fr2, fr3 = format_focus_note(
+                    code, is_on, short_status, short_detail
+                )
+
+                # Default note_block = focus (single appliance layout)
+                r1, r2, r3, block = fr1, fr2, fr3, focus_block
+
                 rows.append(
                     {
                         "index": str(idx + 1),
                         "name": short_name[:20],
                         "name_full": name[:40],
+                        "code": code,
                         "ha_id": ha_id[:40],
-                        "type": abridge_status(str(app.get("type") or ""), 15),
+                        "type": abridge_status(type_raw, 15),
                         "connected": "YES" if connected else "NO",
+                        "is_on": "YES" if is_on else "NO",
+                        "remaining_minutes": str(remaining) if remaining is not None else "",
                         "status": short_status[:15],
                         "status_full": primary[:80],
                         "detail": short_detail[:15],
-                        "status_indicator": ind["indicator"],
-                        "status_indicator_name": ind["indicator_name"],
-                        "status_indicator_label": ind["indicator_label"],
-                        "status_indicator_pair": ind["indicator_pair"],
+                        "status_indicator": GREEN if is_on else RED,
+                        "status_indicator_name": "green" if is_on else "red",
+                        "status_indicator_label": "ON" if is_on else "OFF",
+                        "status_indicator_pair": f"{GREEN}{GREEN}" if is_on else f"{RED}{RED}",
+                        "summary_line": summary_line,
                         "note_row1": r1,
                         "note_row2": r2,
                         "note_row3": r3,
                         "note_block": block,
+                        "focus_note_block": focus_block,
+                        "focus_note_row1": fr1,
+                        "focus_note_row2": fr2,
+                        "focus_note_row3": fr3,
                     }
                 )
 
             if rows:
                 p0 = rows[0]
+                # Multi-appliance summary strip (one line per device, joined)
+                summaries = [r.get("summary_line") or "" for r in rows]
+                board_summary = " | ".join(s for s in summaries if s)
                 data = {
                     **meta,
                     "appliance_count": str(len(rows)),
                     "online_count": str(online),
                     "name": p0["name"],
+                    "code": p0.get("code", ""),
                     "status": p0["status"],
                     "detail": p0["detail"],
+                    "is_on": p0.get("is_on", ""),
+                    "remaining_minutes": p0.get("remaining_minutes", ""),
+                    "summary_line": p0.get("summary_line", ""),
+                    "board_summary": board_summary[:200],
                     "status_indicator": p0.get("status_indicator", ""),
                     "status_indicator_name": p0.get("status_indicator_name", ""),
                     "status_indicator_label": p0.get("status_indicator_label", ""),
@@ -623,6 +823,10 @@ class HomeConnectPlugin(PluginBase):
                     "note_row2": p0["note_row2"],
                     "note_row3": p0["note_row3"],
                     "note_block": p0["note_block"],
+                    "focus_note_block": p0.get("focus_note_block", p0["note_block"]),
+                    "focus_note_row1": p0.get("focus_note_row1", p0["note_row1"]),
+                    "focus_note_row2": p0.get("focus_note_row2", p0["note_row2"]),
+                    "focus_note_row3": p0.get("focus_note_row3", p0["note_row3"]),
                     "appliances": rows,
                     "refresh_mode": "FORCED" if force else "ACTIVE",
                     "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -669,12 +873,17 @@ class HomeConnectPlugin(PluginBase):
             if i < len(rows):
                 a = rows[i]
                 data[f"appliance_{i+1}_name"] = a["name"]
+                data[f"appliance_{i+1}_code"] = a.get("code", "")
                 data[f"appliance_{i+1}_status"] = a["status"]
                 data[f"appliance_{i+1}_detail"] = a["detail"]
+                data[f"appliance_{i+1}_is_on"] = a.get("is_on", "")
+                data[f"appliance_{i+1}_remaining_minutes"] = a.get("remaining_minutes", "")
+                data[f"appliance_{i+1}_summary_line"] = a.get("summary_line", "")
                 data[f"appliance_{i+1}_note_block"] = a["note_block"]
                 data[f"appliance_{i+1}_note_row1"] = a["note_row1"]
                 data[f"appliance_{i+1}_note_row2"] = a["note_row2"]
                 data[f"appliance_{i+1}_note_row3"] = a["note_row3"]
+                data[f"appliance_{i+1}_focus_note_block"] = a.get("focus_note_block", a["note_block"])
                 data[f"appliance_{i+1}_connected"] = a.get("connected", "")
                 data[f"appliance_{i+1}_status_indicator"] = a.get("status_indicator", "")
                 data[f"appliance_{i+1}_status_indicator_name"] = a.get("status_indicator_name", "")
@@ -682,8 +891,9 @@ class HomeConnectPlugin(PluginBase):
                 data[f"appliance_{i+1}_status_indicator_pair"] = a.get("status_indicator_pair", "")
             else:
                 for suf in (
-                    "name", "status", "detail", "note_block",
-                    "note_row1", "note_row2", "note_row3", "connected",
+                    "name", "code", "status", "detail", "is_on", "remaining_minutes",
+                    "summary_line", "note_block", "note_row1", "note_row2", "note_row3",
+                    "focus_note_block", "connected",
                     "status_indicator", "status_indicator_name",
                     "status_indicator_label", "status_indicator_pair",
                 ):
@@ -692,49 +902,58 @@ class HomeConnectPlugin(PluginBase):
 
     def _demo_data(self) -> Dict[str, Any]:
         samples = [
-            ("Washer", "prog run", "42m left"),
-            ("Dishwasher", "done", "door shut"),
-            ("Oven", "off", ""),
-            ("Dryer", "ready", ""),
-            ("Fridge", "on", "3C"),
+            ("Washing Machine", "Washer", "prog run", "42m left", True, 42),
+            ("Dishwasher", "Dishwasher", "done", "door shut", False, None),
+            ("Oven", "Oven", "off", "", False, None),
+            ("Microwave Oven", "Microwave", "ready", "", False, None),
+            ("Coffee Machine", "CoffeeMaker", "run", "3m left", True, 3),
         ]
         rows = []
-        for i, (name, st, det) in enumerate(samples):
-            ind = status_indicator(st, True)
-            block, r1, r2, r3 = abridge_note_block(name, st, det)
-            body = re.sub(r"^(\{\d{2}\}){1,2}", "", r1)
-            r1 = f"{ind['indicator_pair']}{body}"
-            while _tile_len(r1) > NOTE_WIDTH and body:
-                body = body[:-1]
-                r1 = f"{ind['indicator_pair']}{body}"
-            block = f"{r1}\n{r2}\n{r3}"
+        for i, (name, typ, st, det, is_on, mins) in enumerate(samples):
+            code = appliance_type_code(name, typ)
+            summary_line = format_appliance_summary_line(code, is_on, mins)
+            focus_block, fr1, fr2, fr3 = format_focus_note(code, is_on, st, det)
             rows.append(
                 {
                     "index": str(i + 1),
-                    "name": name,
+                    "name": abridge_status(name, 13),
                     "name_full": name,
+                    "code": code,
                     "ha_id": f"demo-{i}",
-                    "type": name,
+                    "type": typ,
                     "connected": "YES",
+                    "is_on": "YES" if is_on else "NO",
+                    "remaining_minutes": str(mins) if mins is not None else "",
                     "status": st,
                     "status_full": st,
                     "detail": det,
-                    "status_indicator": ind["indicator"],
-                    "status_indicator_name": ind["indicator_name"],
-                    "status_indicator_label": ind["indicator_label"],
-                    "status_indicator_pair": ind["indicator_pair"],
-                    "note_row1": r1,
-                    "note_row2": r2,
-                    "note_row3": r3,
-                    "note_block": block,
+                    "status_indicator": GREEN if is_on else RED,
+                    "status_indicator_name": "green" if is_on else "red",
+                    "status_indicator_label": "ON" if is_on else "OFF",
+                    "status_indicator_pair": f"{GREEN}{GREEN}" if is_on else f"{RED}{RED}",
+                    "summary_line": summary_line,
+                    "note_row1": fr1,
+                    "note_row2": fr2,
+                    "note_row3": fr3,
+                    "note_block": focus_block,
+                    "focus_note_block": focus_block,
+                    "focus_note_row1": fr1,
+                    "focus_note_row2": fr2,
+                    "focus_note_row3": fr3,
                 }
             )
+        summaries = [r.get("summary_line") or "" for r in rows]
         data: Dict[str, Any] = {
             "appliance_count": "5",
             "online_count": "5",
             "name": rows[0]["name"],
+            "code": rows[0].get("code", ""),
             "status": rows[0]["status"],
             "detail": rows[0]["detail"],
+            "is_on": rows[0].get("is_on", ""),
+            "remaining_minutes": rows[0].get("remaining_minutes", ""),
+            "summary_line": rows[0].get("summary_line", ""),
+            "board_summary": " | ".join(summaries)[:200],
             "status_indicator": rows[0].get("status_indicator", ""),
             "status_indicator_name": rows[0].get("status_indicator_name", ""),
             "status_indicator_label": rows[0].get("status_indicator_label", ""),
@@ -743,6 +962,10 @@ class HomeConnectPlugin(PluginBase):
             "note_row2": rows[0]["note_row2"],
             "note_row3": rows[0]["note_row3"],
             "note_block": rows[0]["note_block"],
+            "focus_note_block": rows[0].get("focus_note_block", ""),
+            "focus_note_row1": rows[0].get("focus_note_row1", ""),
+            "focus_note_row2": rows[0].get("focus_note_row2", ""),
+            "focus_note_row3": rows[0].get("focus_note_row3", ""),
             "appliances": rows,
             "last_updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         }
