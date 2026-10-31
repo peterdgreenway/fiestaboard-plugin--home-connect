@@ -889,7 +889,7 @@ class HomeConnectPlugin(PluginBase):
         """Decrypt all secret settings for this refresh cycle (manual or automatic).
 
         Values are returned in plaintext for API use only; config stays encrypted at rest.
-        Debug logs show redacted previews only (never full secrets).
+        Logs never include secret values — only presence, length, and decrypt success.
         """
         secret_keys = (
             "fiestaboard_client_secret",
@@ -901,7 +901,7 @@ class HomeConnectPlugin(PluginBase):
             "stored_access_token",
         )
         out: Dict[str, str] = {}
-        verbose = bool(self.config.get("debug_log_secrets", False))
+        decrypt_failures: List[str] = []
         for key in secret_keys:
             raw = str(self.config.get(key) or "")
             if not raw:
@@ -912,25 +912,39 @@ class HomeConnectPlugin(PluginBase):
             plain = decrypt_secret(raw)
             out[key] = plain if plain is not None else ""
             if was_encrypted and not out[key]:
+                decrypt_failures.append(key)
                 logger.warning(
-                    "Home Connect: failed to decrypt %s — check HOME_CONNECT_FERNET_KEY",
+                    "Home Connect: failed to decrypt %s (stored_len=%s) — "
+                    "check HOME_CONNECT_FERNET_KEY / FIESTABOARD_SECRET_KEY consistency",
                     key,
-                )
-            elif verbose and out[key]:
-                # Explicit opt-in: log more of the value for troubleshooting
-                logger.debug(
-                    "Home Connect decrypt %s [verbose]: stored=%s plain=%s",
-                    key,
-                    "encrypted" if was_encrypted else "plaintext",
-                    out[key],
+                    len(raw),
                 )
             else:
                 logger.debug(
-                    "Home Connect decrypt %s: stored=%s plain=%s",
+                    "Home Connect decrypt %s: stored=%s present=%s len=%s",
                     key,
                     "encrypted" if was_encrypted else "plaintext",
-                    self._redact_secret(out[key]),
+                    bool(out[key]),
+                    len(out[key]),
                 )
+        if decrypt_failures:
+            logger.warning(
+                "Home Connect: decryption failed for: %s. "
+                "Previously stored tokens may be unreadable after a key change.",
+                ", ".join(decrypt_failures),
+            )
+        logger.info(
+            "Home Connect credentials prepared: refresh=%s stored_refresh=%s "
+            "access=%s stored_access=%s client_secret=%s decrypt_failures=%s",
+            "yes" if out.get("refresh_token") else "no",
+            "yes" if out.get("stored_refresh_token") else "no",
+            "yes" if out.get("access_token") else "no",
+            "yes" if out.get("stored_access_token") else "no",
+            "yes"
+            if (out.get("fiestaboard_client_secret") or out.get("client_secret"))
+            else "no",
+            len(decrypt_failures),
+        )
         return out
 
     def _api_roots(self) -> Tuple[str, str, str]:
@@ -976,6 +990,24 @@ class HomeConnectPlugin(PluginBase):
 
     def _token_request(self, body: Dict[str, str]) -> Dict[str, Any]:
         _, _, token_url = self._api_roots()
+        grant = (body.get("grant_type") or "").strip() or "unknown"
+        # Never log secrets: only presence + length of sensitive fields
+        has_refresh = bool(body.get("refresh_token"))
+        has_secret = bool(body.get("client_secret"))
+        has_code = bool(body.get("code"))
+        has_client_id = bool(body.get("client_id"))
+        logger.info(
+            "Home Connect token request: grant=%s client_id_present=%s "
+            "client_secret_present=%s refresh_token_present=%s "
+            "refresh_token_len=%s authorization_code_present=%s url=%s",
+            grant,
+            has_client_id,
+            has_secret,
+            has_refresh,
+            len(body.get("refresh_token") or ""),
+            has_code,
+            token_url,
+        )
         data = urllib.parse.urlencode({k: v for k, v in body.items() if v}).encode("utf-8")
         req = urllib.request.Request(
             token_url,
@@ -988,28 +1020,92 @@ class HomeConnectPlugin(PluginBase):
         )
         try:
             with urllib.request.urlopen(req, timeout=45) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
+                status = getattr(resp, "status", None) or resp.getcode()
+                raw = resp.read().decode("utf-8")
+                payload = json.loads(raw)
                 # Token endpoint counts toward daily Home Connect budget
                 try:
                     self._budget_consume(1)
                 except Exception:
                     pass
+                has_access = bool(payload.get("access_token"))
+                has_new_refresh = bool(payload.get("refresh_token"))
+                err_key = payload.get("error") or ""
+                err_desc = payload.get("error_description") or payload.get("error_uri") or ""
+                logger.info(
+                    "Home Connect token response: http_status=%s access_token_present=%s "
+                    "access_token_len=%s refresh_token_present=%s expires_in=%s "
+                    "error_key=%s error_description=%s",
+                    status,
+                    has_access,
+                    len(payload.get("access_token") or ""),
+                    has_new_refresh,
+                    payload.get("expires_in"),
+                    err_key or "(none)",
+                    (str(err_desc)[:120] if err_desc else "(none)"),
+                )
+                if err_key and not has_access:
+                    raise RuntimeError(
+                        f"Token endpoint error: {err_key}"
+                        + (f" — {err_desc}" if err_desc else "")
+                    )
                 return payload
         except urllib.error.HTTPError as e:
-            err = e.read().decode("utf-8", errors="replace")[:400]
+            err_body = e.read().decode("utf-8", errors="replace")[:400]
+            err_key = ""
+            err_desc = ""
+            try:
+                err_json = json.loads(err_body)
+                if isinstance(err_json, dict):
+                    err_key = str(err_json.get("error") or err_json.get("key") or "")
+                    err_desc = str(
+                        err_json.get("error_description")
+                        or err_json.get("description")
+                        or ""
+                    )[:120]
+            except Exception:
+                pass
+            logger.warning(
+                "Home Connect token request HTTP error: status=%s error_key=%s "
+                "error_description=%s body_len=%s",
+                e.code,
+                err_key or "(none)",
+                err_desc or "(none)",
+                len(err_body),
+            )
             if e.code == 429:
-                self._suspend_for_429(3600, err)
-                raise HomeConnectRateLimitError(err, retry_after=3600) from e
-            raise RuntimeError(f"Token request failed: {e.code} {err}") from e
+                self._suspend_for_429(3600, err_body)
+                raise HomeConnectRateLimitError(err_body, retry_after=3600) from e
+            detail = err_desc or err_body[:200]
+            raise RuntimeError(
+                f"Token request failed: HTTP {e.code}"
+                + (f" [{err_key}]" if err_key else "")
+                + (f" {detail}" if detail else "")
+            ) from e
+        except urllib.error.URLError as e:
+            logger.warning("Home Connect token request network error: %s", e)
+            raise RuntimeError(f"Token request network error: {e}") from e
 
     def _persist_tokens(self, payload: Dict[str, Any]) -> str:
         access = payload.get("access_token") or ""
         refresh = payload.get("refresh_token") or ""
         id_tok = payload.get("id_token") or ""
+        expires_in = payload.get("expires_in")
         if access:
             enc = encrypt_secret(access)
             self.config["stored_access_token"] = enc
             self.config["access_token"] = enc
+            # Keep process + disk token cache in sync so restarts can reuse access
+            _TOKEN_CACHE["access_token"] = access
+            try:
+                skew = 120  # refresh a little early
+                if expires_in is not None:
+                    _TOKEN_CACHE["expires_at"] = time.time() + max(60, int(expires_in) - skew)
+                else:
+                    # Home Connect access tokens are typically 24h; be conservative
+                    _TOKEN_CACHE["expires_at"] = time.time() + (23 * 3600)
+            except (TypeError, ValueError):
+                _TOKEN_CACHE["expires_at"] = time.time() + (23 * 3600)
         if refresh:
             enc = encrypt_secret(refresh)
             self.config["stored_refresh_token"] = enc
@@ -1017,13 +1113,33 @@ class HomeConnectPlugin(PluginBase):
         if id_tok:
             self.config["id_token"] = encrypt_secret(id_tok)
         if not access:
-            raise RuntimeError(
-                payload.get("error_description") or payload.get("error") or "no access_token"
+            err = (
+                payload.get("error_description")
+                or payload.get("error")
+                or "no access_token in token response"
             )
+            logger.warning(
+                "Home Connect persist_tokens: no access_token (error=%s)",
+                str(err)[:120],
+            )
+            raise RuntimeError(str(err))
         # Clear one-time code / button flags after success
         self.config["authorization_code"] = ""
         self.config["exchange_authorization_code"] = False
         self.config["get_oauth_tokens"] = False
+        try:
+            _save_persistent_state()
+            logger.info(
+                "Home Connect tokens persisted: access_token_len=%s "
+                "refresh_token_updated=%s expires_at=%s config_fields=access+stored_access"
+                "%s",
+                len(access),
+                "yes" if refresh else "no",
+                int(_TOKEN_CACHE.get("expires_at") or 0),
+                "+refresh+stored_refresh" if refresh else "",
+            )
+        except Exception as e:
+            logger.warning("Home Connect: state file save after token persist failed: %s", e)
         return access
 
     def _exchange_authorization_code(self) -> str:
@@ -1069,56 +1185,116 @@ class HomeConnectPlugin(PluginBase):
     def _get_token(self) -> str:
         """Resolve API bearer token.
 
-        Priority when manual tokens are set:
-          1) refresh_token → exchange for access_token
-          2) id_token (used as Bearer if no refresh path)
-          3) access_token
-        Then: authorization code exchange, stored tokens, authorize URL error.
-
-        Always decrypts secrets first via _prepare_credentials().
+        Priority:
+          1) refresh_token → exchange for a new access_token (required when present)
+          2) authorization code exchange (one-time setup)
+          3) non-expired cached / stored access_token
+        Never use id_token as a Bearer token for the Home Connect API.
+        If a refresh token exists and the refresh fails, raise a clear error —
+        do not silently fall back to an expired access token.
         """
         self._creds = self._prepare_credentials()
         _, fb_id, fb_secret = self._client_ids()
 
-        # --- 1) refresh_token (user-entered or stored) ---
+        # --- Diagnostics: credential presence (never log values) ---
         refresh = self._token_from_config("refresh_token", "stored_refresh_token")
+        stored_access = self._token_from_config("access_token", "stored_access_token")
+        id_tok = self._token_from_config("id_token")
+        logger.info(
+            "Home Connect _get_token: refresh_token_present=%s refresh_token_len=%s "
+            "access_token_present=%s access_token_len=%s id_token_present=%s "
+            "client_id_present=%s client_secret_present=%s",
+            bool(refresh),
+            len(refresh or ""),
+            bool(stored_access),
+            len(stored_access or ""),
+            bool(id_tok),
+            bool(fb_id),
+            bool(fb_secret),
+        )
+
+        # --- 1) refresh_token (user-entered or stored) ---
         if refresh:
+            if not fb_id:
+                logger.warning(
+                    "Home Connect: refresh_token present but Client ID missing — "
+                    "cannot refresh"
+                )
+                raise RuntimeError(
+                    "Home Connect authentication failed: a refresh token is stored "
+                    "but Fiestaboard Client ID is missing. Set the Client ID "
+                    "(and Client Secret if required by your app) then retry."
+                )
             body = {
                 "grant_type": "refresh_token",
                 "refresh_token": refresh,
-                "client_id": fb_id or "",
+                "client_id": fb_id,
             }
             if fb_secret:
                 body["client_secret"] = fb_secret
-            if fb_id:
-                try:
-                    access = self._persist_tokens(self._token_request(body))
-                    # Keep user refresh_token field in sync if rotated
-                    return access
-                except Exception as e:
-                    logger.warning("refresh_token exchange failed: %s", e)
-            else:
-                logger.warning("refresh_token set but Fiestaboard Client ID missing")
+            try:
+                logger.info("Home Connect: attempting refresh_token exchange")
+                access = self._persist_tokens(self._token_request(body))
+                logger.info(
+                    "Home Connect: refresh succeeded; using new access_token "
+                    "(len=%s)",
+                    len(access),
+                )
+                return access
+            except HomeConnectRateLimitError:
+                # Preserve rate-limit handling for callers
+                raise
+            except Exception as e:
+                # Do NOT fall through to an expired access token or id_token.
+                logger.warning(
+                    "Home Connect: refresh_token exchange failed — not falling "
+                    "back to stored access/id token. error=%s",
+                    e,
+                )
+                raise RuntimeError(
+                    "Home Connect authentication failed: refresh token exchange "
+                    f"failed ({e}). Re-authorise via Get tokens via OAuth, or "
+                    "paste a new refresh token. Do not rely on the expired "
+                    "access token."
+                ) from e
 
         # --- authorization code / Get tokens via OAuth button ---
         get_tokens = bool(self.config.get("get_oauth_tokens", False))
         exchange = bool(self.config.get("exchange_authorization_code", False))
         has_code = bool((self.config.get("authorization_code") or "").strip())
         if (get_tokens or exchange) and has_code:
+            logger.info("Home Connect: exchanging authorization code")
             return self._exchange_authorization_code()
         if has_code and not refresh:
+            logger.info("Home Connect: exchanging authorization code (code present)")
             return self._exchange_authorization_code()
 
-        # --- 2) id_token ---
-        id_tok = self._token_from_config("id_token")
-        if id_tok:
-            logger.info("Home Connect: using id_token as Bearer (priority 2)")
-            return id_tok
+        # --- 2) access_token only (never id_token as Bearer) ---
+        # Prefer in-memory cache if still valid
+        cached = (_TOKEN_CACHE.get("access_token") or "").strip()
+        exp = float(_TOKEN_CACHE.get("expires_at") or 0)
+        if cached and exp and time.time() < exp:
+            logger.info(
+                "Home Connect: using cached access_token (len=%s, expires_in≈%ss)",
+                len(cached),
+                int(exp - time.time()),
+            )
+            return cached
+        if stored_access:
+            logger.info(
+                "Home Connect: using stored access_token (len=%s) — "
+                "no refresh_token available to renew it",
+                len(stored_access),
+            )
+            return stored_access
 
-        # --- 3) access_token (user-entered or stored) ---
-        access = self._token_from_config("access_token", "stored_access_token")
-        if access:
-            return access
+        if id_tok:
+            # Explicitly refuse to use id_token as API Bearer (OpenID identity only)
+            logger.warning(
+                "Home Connect: id_token is present but will NOT be used as Bearer "
+                "(Home Connect API requires access_token). Re-authorise to obtain "
+                "access + refresh tokens."
+            )
 
         auth_url = self.build_authorize_url()
         if bool(self.config.get("get_oauth_tokens", False)):
@@ -1128,7 +1304,7 @@ class HomeConnectPlugin(PluginBase):
                 + (auth_url or "Set Fiestaboard Client ID first.")
             )
         raise RuntimeError(
-            "Not authorized. Enter refresh_token, id_token, or access_token, "
+            "Not authorized. Enter a refresh_token (preferred) or access_token, "
             "or use Get tokens via OAuth. "
             + (auth_url or "(set Client ID first)")
         )
